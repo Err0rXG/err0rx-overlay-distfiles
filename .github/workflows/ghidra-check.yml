@@ -97,14 +97,21 @@ jobs:
             's/^application.gradle.max=//p' \
             source/ghidra/Ghidra/application.properties)"
 
+          JAVA_VERSION="$(sed -n \
+            's/^application.java.compiler=//p' \
+            source/ghidra/Ghidra/application.properties)"
+
           echo "Expected version: ${VERSION}"
           echo "Source version:   ${SOURCE_VERSION}"
+          echo "Java compiler:    ${JAVA_VERSION}"
           echo "Gradle minimum:   ${GRADLE_MIN}"
           echo "Gradle maximum:   ${GRADLE_MAX:-none}"
 
           test "${SOURCE_VERSION}" = "${VERSION}"
+          test -n "${JAVA_VERSION}"
           test -n "${GRADLE_MIN}"
 
+          echo "java_version=${JAVA_VERSION}" >> "$GITHUB_OUTPUT"
           echo "gradle_min=${GRADLE_MIN}" >> "$GITHUB_OUTPUT"
           echo "gradle_max=${GRADLE_MAX}" >> "$GITHUB_OUTPUT"
 
@@ -124,7 +131,7 @@ jobs:
         uses: actions/setup-java@v6
         with:
           distribution: temurin
-          java-version: "21"
+          java-version: "${{ steps.source.outputs.java_version }}"
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v6
