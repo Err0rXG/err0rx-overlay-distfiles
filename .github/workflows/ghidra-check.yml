@@ -8,6 +8,9 @@ on:
 permissions:
   contents: write
 
+env:
+  DEPENDENCY_GRADLE_VERSION: "9.8.0"
+
 jobs:
   check:
     runs-on: ubuntu-latest
@@ -143,7 +146,8 @@ jobs:
         if: steps.ghidra.outputs.release_exists != 'true'
         uses: gradle/actions/setup-gradle@v6
         with:
-          gradle-version: "${{ steps.source.outputs.gradle_min }}"
+          #gradle-version: "${{ steps.source.outputs.gradle_min }}"
+          gradle-version: "${{ env.DEPENDENCY_GRADLE_VERSION }}"
 
       - name: Verify build environment
         if: steps.ghidra.outputs.release_exists != 'true'
