@@ -88,10 +88,24 @@ jobs:
             's/^application.version=//p' \
             source/ghidra/Ghidra/application.properties)"
 
+          GRADLE_MIN="$(sed -n \
+            's/^application.gradle.min=//p' \
+            source/ghidra/Ghidra/application.properties)"
+
+          GRADLE_MAX="$(sed -n \
+            's/^application.gradle.max=//p' \
+            source/ghidra/Ghidra/application.properties)"
+
           echo "Expected version: ${VERSION}"
           echo "Source version:   ${SOURCE_VERSION}"
+          echo "Gradle minimum:   ${GRADLE_MIN}"
+          echo "Gradle maximum:   ${GRADLE_MAX:-none}"
 
           test "${SOURCE_VERSION}" = "${VERSION}"
+          test -n "${GRADLE_MIN}"
+
+          echo "gradle_min=${GRADLE_MIN}" >> "$GITHUB_OUTPUT"
+          echo "gradle_max=${GRADLE_MAX}" >> "$GITHUB_OUTPUT"
 
           echo "Ghidra source verification passed."
 
@@ -109,7 +123,7 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v6
         with:
-          gradle-version: "8.5"
+          gradle-version: "${{ steps.source.outputs.gradle_min }}"
 
       - name: Verify build environment
         working-directory: source/ghidra
