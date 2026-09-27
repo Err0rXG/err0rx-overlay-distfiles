@@ -182,6 +182,9 @@ jobs:
         run: |
           set -euo pipefail
 
+          ARCHIVE="../../ghidra-dependencies-${VERSION}.tar.gz"
+          CHECKSUM="../../ghidra-dependencies-${VERSION}.tar.gz.sha256"
+
           tar -czf \
             "../../ghidra-dependencies-${VERSION}.tar.gz" \
             dependencies
@@ -191,3 +194,17 @@ jobs:
 
           ls -lh \
             "../../ghidra-dependencies-${VERSION}.tar.gz"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.ghidra.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          gh release create "ghidra-${VERSION}" \
+            --repo Err0rXG/err0rx-overlay-distfiles \
+            --title "Ghidra ${VERSION} dependencies" \
+            --notes "Auto-generated, offline-verified Gradle dependency bundle for Ghidra_${VERSION}_build" \
+            "ghidra-dependencies-${VERSION}.tar.gz" \
+            "ghidra-dependencies-${VERSION}.tar.gz.sha256"
