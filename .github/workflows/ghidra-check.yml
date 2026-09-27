@@ -1,0 +1,43 @@
+name: Check Ghidra Release
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 4 * * *"
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check Latest Ghidra Release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TAG="$(curl -fsSL \
+            https://api.github.com/repos/NationalSecurityAgency/ghidra/releases/latest \
+            | jq -r '.tag_name')"
+
+          VERSION="${TAG#Ghidra_}"
+          VERSION="${VERSION%_build}"
+
+          OUR_RELEASE="ghidra-${VERSION}"
+
+          echo "Upstream tag : ${TAG}"
+          echo "Ghidra version: ${VERSION}"
+          echo "Our release  : ${OUR_RELEASE}"
+
+          STATUS="$(curl -s -o /dev/null -w '%{http_code}' \
+            "https://api.github.com/repos/Err0rXG/err0rx-overlay-distfiles/releases/tags/${OUR_RELEASE}")"
+
+          echo "Our release HTTP status: ${STATUS}"
+
+          if [[ "${STATUS}" == "200" ]]; then
+            echo "Distfile release already exists."
+          elif [[ "${STATUS}" == "404" ]]; then
+            echo "Distfile release does not exist yet."
+          else
+            echo "Unexpected GitHub API status: ${STATUS}"
+            exit 1
+          fi
