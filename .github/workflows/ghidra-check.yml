@@ -1,4 +1,4 @@
-name: Check Ghidra Release
+name: Check Ghidra release
 
 on:
   workflow_dispatch:
@@ -10,7 +10,8 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Check Latest Ghidra Release
+      - name: Check latest Ghidra release
+        id: ghidra
         shell: bash
         run: |
           set -euo pipefail
@@ -24,9 +25,9 @@ jobs:
 
           OUR_RELEASE="ghidra-${VERSION}"
 
-          echo "Upstream tag : ${TAG}"
+          echo "Upstream tag  : ${TAG}"
           echo "Ghidra version: ${VERSION}"
-          echo "Our release  : ${OUR_RELEASE}"
+          echo "Our release   : ${OUR_RELEASE}"
 
           STATUS="$(curl -s -o /dev/null -w '%{http_code}' \
             "https://api.github.com/repos/Err0rXG/err0rx-overlay-distfiles/releases/tags/${OUR_RELEASE}")"
@@ -41,3 +42,60 @@ jobs:
             echo "Unexpected GitHub API status: ${STATUS}"
             exit 1
           fi
+
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Download Ghidra source
+        shell: bash
+        env:
+          TAG: ${{ steps.ghidra.outputs.tag }}
+          VERSION: ${{ steps.ghidra.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p source
+
+          echo "Downloading Ghidra ${VERSION} (${TAG})..."
+
+          curl -fL \
+            "https://github.com/NationalSecurityAgency/ghidra/archive/refs/tags/${TAG}.tar.gz" \
+            -o source/ghidra.tar.gz
+
+          echo "Extracting source..."
+
+          mkdir -p source/ghidra
+
+          tar -xzf source/ghidra.tar.gz \
+            --strip-components=1 \
+            -C source/ghidra
+
+      - name: Verify Ghidra source
+        shell: bash
+        env:
+          TAG: ${{ steps.ghidra.outputs.tag }}
+          VERSION: ${{ steps.ghidra.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          echo "Checking extracted source..."
+
+          test -f source/ghidra/Ghidra/application.properties
+          test -f source/ghidra/gradlew
+          test -f source/ghidra/gradle/support/fetchDependencies.gradle
+
+          SOURCE_VERSION="$(sed -n \
+            's/^application.version=//p' \
+            source/ghidra/Ghidra/application.properties)"
+
+          echo "Expected version: ${VERSION}"
+          echo "Source version:   ${SOURCE_VERSION}"
+
+          test "${SOURCE_VERSION}" = "${VERSION}"
+
+          echo "Ghidra source verification passed."
+
+      - name: Show source contents
+        run: |
+          du -sh source/ghidra
+          ls -la source/ghidra
