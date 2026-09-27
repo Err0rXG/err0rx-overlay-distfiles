@@ -229,3 +229,81 @@ jobs:
 
           echo
           echo "Offline Gradle cache verification passed."
+
+
+      - name: Create dependency archive
+        working-directory: source/ghidra
+        env:
+          VERSION: ${{ steps.ghidra.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          tar -czf \
+            "../../ghidra-dependencies-${VERSION}.tar.gz" \
+            dependencies
+
+          sha256sum \
+            "../../ghidra-dependencies-${VERSION}.tar.gz"
+
+          ls -lh \
+            "../../ghidra-dependencies-${VERSION}.tar.gz"
+
+      - name: Prepare clean offline test tree
+        env:
+          VERSION: ${{ steps.ghidra.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          rm -rf offline-test
+          mkdir -p offline-test/ghidra
+
+          tar -xzf source/ghidra.tar.gz \
+            --strip-components=1 \
+            -C offline-test/ghidra
+
+          tar -xzf \
+            "ghidra-dependencies-${VERSION}.tar.gz" \
+            -C offline-test/ghidra
+
+          echo "Clean source:"
+          du -sh offline-test/ghidra
+
+          echo
+          echo "Extracted dependencies:"
+          du -sh offline-test/ghidra/dependencies
+
+      - name: Test Ghidra completely offline
+        working-directory: offline-test/ghidra
+        run: |
+          set -euo pipefail
+
+          echo "Running Ghidra prepDev in offline mode..."
+
+          gradle \
+            --offline \
+            -g dependencies/gradle \
+            prepdev
+
+      - name: Verify offline build result
+        working-directory: offline-test/ghidra
+        run: |
+          set -euo pipefail
+
+          JAR="$(find \
+            dependencies/gradle/caches/modules-2/files-2.1/org.apache.commons/commons-collections4/4.6.0 \
+            -type f \
+            -name 'commons-collections4-4.6.0.jar' \
+            -print -quit)"
+
+          POM="$(find \
+            dependencies/gradle/caches/modules-2/files-2.1/org.apache.commons/commons-collections4/4.6.0 \
+            -type f \
+            -name 'commons-collections4-4.6.0.pom' \
+            -print -quit)"
+
+          test -n "${JAR}"
+          test -n "${POM}"
+
+          echo "Offline test succeeded."
+          echo "JAR: ${JAR}"
+          echo "POM: ${POM}"
