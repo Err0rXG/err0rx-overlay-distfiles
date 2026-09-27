@@ -185,15 +185,12 @@ jobs:
           ARCHIVE="../../ghidra-dependencies-${VERSION}.tar.gz"
           CHECKSUM="../../ghidra-dependencies-${VERSION}.tar.gz.sha256"
 
-          tar -czf \
-            "../../ghidra-dependencies-${VERSION}.tar.gz" \
-            dependencies
+          tar -czf "${ARCHIVE}" dependencies
 
-          sha256sum \
-            "../../ghidra-dependencies-${VERSION}.tar.gz"
+          sha256sum "${ARCHIVE}" > "${CHECKSUM}"
 
-          ls -lh \
-            "../../ghidra-dependencies-${VERSION}.tar.gz"
+          ls -lh "${ARCHIVE}" "${CHECKSUM}"
+          cat "${CHECKSUM}"
 
       - name: Publish release
         env:
