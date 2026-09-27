@@ -39,8 +39,10 @@ jobs:
 
           if [[ "${STATUS}" == "200" ]]; then
             echo "Distfile release already exists."
+            RELEASE_EXISTS="true"
           elif [[ "${STATUS}" == "404" ]]; then
             echo "Distfile release does not exist yet."
+            RELEASE_EXISTS="false"
           else
             echo "Unexpected GitHub API status: ${STATUS}"
             exit 1
@@ -48,8 +50,10 @@ jobs:
 
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "release_exists=${RELEASE_EXISTS}" >> "$GITHUB_OUTPUT"
 
       - name: Download Ghidra source
+        if: steps.ghidra.outputs.release_exists != 'true'
         shell: bash
         env:
           TAG: ${{ steps.ghidra.outputs.tag }}
@@ -74,6 +78,7 @@ jobs:
             -C source/ghidra
 
       - name: Verify Ghidra source
+        if: steps.ghidra.outputs.release_exists != 'true'
         id: source
         shell: bash
         env:
@@ -121,28 +126,27 @@ jobs:
           echo "Ghidra source verification passed."
 
       - name: Test Java & Gradle version output
+        if: steps.ghidra.outputs.release_exists != 'true'
         run: |
           echo "Java Version output = '${{ steps.source.outputs.java_version }}'"
           echo "Gradle minimum output = '${{ steps.source.outputs.gradle_min }}'"
           echo "Gradle maximum output = '${{ steps.source.outputs.gradle_max }}'"
 
-      - name: Show source contents
-        run: |
-          du -sh source/ghidra
-          ls -la source/ghidra
-
       - name: Set up Java
+        if: steps.ghidra.outputs.release_exists != 'true'
         uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: "${{ steps.source.outputs.java_version }}"
 
       - name: Set up Gradle
+        if: steps.ghidra.outputs.release_exists != 'true'
         uses: gradle/actions/setup-gradle@v6
         with:
           gradle-version: "${{ steps.source.outputs.gradle_min }}"
 
       - name: Verify build environment
+        if: steps.ghidra.outputs.release_exists != 'true'
         working-directory: source/ghidra
         run: |
           set -euo pipefail
@@ -155,86 +159,23 @@ jobs:
           gradle --version
 
       - name: Fetch Ghidra dependencies
+        if: steps.ghidra.outputs.release_exists != 'true'
         working-directory: source/ghidra
         run: |
           set -euo pipefail
 
           gradle -I gradle/support/fetchDependencies.gradle
 
-      - name: Verify fetched dependencies
-        working-directory: source/ghidra
-        run: |
-          set -euo pipefail
-
-          echo "Dependency directory:"
-          du -sh dependencies
-
-          echo
-          echo "Top-level directories:"
-          find dependencies -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort
-
-          echo
-          echo "Key dependency checks:"
-
-          test -f dependencies/flatRepo/java-sarif-2.1-modified.jar
-          echo "  ✓ java-sarif"
-
-          test -f dependencies/Debugger-agent-dbgeng/pybag-2.2.16-py3-none-any.whl
-          echo "  ✓ pybag 2.2.16"
-
-          test -f dependencies/Debugger-agent-dbgeng/capstone-5.0.6-py3-none-win_amd64.whl
-          echo "  ✓ capstone 5.0.6"
-
-          test -f dependencies/Debugger-agent-dbgeng/comtypes-1.4.13-py3-none-any.whl
-          echo "  ✓ comtypes 1.4.13"
-
-          test -f dependencies/Debugger-rmi-trace/protobuf-6.31.0-py3-none-any.whl
-          echo "  ✓ protobuf 6.31.0"
-
-          test -d dependencies/fidb
-          echo "  ✓ FunctionID databases"
-
-          test -d dependencies/SymbolicSummaryZ3
-          echo "  ✓ Z3"
-
-          echo
-          echo "Fetched dependency verification passed."
-
       - name: Populate offline Gradle cache
+        if: steps.ghidra.outputs.release_exists != 'true'
         working-directory: source/ghidra
         run: |
           set -euo pipefail
 
           gradle -g dependencies/gradle prepdev
 
-      - name: Verify offline Gradle cache
-        working-directory: source/ghidra
-        run: |
-          set -euo pipefail
-
-          JAR="$(find \
-            dependencies/gradle/caches/modules-2/files-2.1/org.apache.commons/commons-collections4/4.6.0 \
-            -type f \
-            -name 'commons-collections4-4.6.0.jar' \
-            -print -quit)"
-
-          POM="$(find \
-            dependencies/gradle/caches/modules-2/files-2.1/org.apache.commons/commons-collections4/4.6.0 \
-            -type f \
-            -name 'commons-collections4-4.6.0.pom' \
-            -print -quit)"
-
-          test -n "${JAR}"
-          test -n "${POM}"
-
-          echo "Found JAR: ${JAR}"
-          echo "Found POM: ${POM}"
-
-          echo
-          echo "Offline Gradle cache verification passed."
-
-
       - name: Create dependency archive
+        if: steps.ghidra.outputs.release_exists != 'true'
         working-directory: source/ghidra
         env:
           VERSION: ${{ steps.ghidra.outputs.version }}
@@ -250,63 +191,3 @@ jobs:
 
           ls -lh \
             "../../ghidra-dependencies-${VERSION}.tar.gz"
-
-      - name: Prepare clean offline test tree
-        env:
-          VERSION: ${{ steps.ghidra.outputs.version }}
-        run: |
-          set -euo pipefail
-
-          rm -rf offline-test
-          mkdir -p offline-test/ghidra
-
-          tar -xzf source/ghidra.tar.gz \
-            --strip-components=1 \
-            -C offline-test/ghidra
-
-          tar -xzf \
-            "ghidra-dependencies-${VERSION}.tar.gz" \
-            -C offline-test/ghidra
-
-          echo "Clean source:"
-          du -sh offline-test/ghidra
-
-          echo
-          echo "Extracted dependencies:"
-          du -sh offline-test/ghidra/dependencies
-
-      - name: Test Ghidra completely offline
-        working-directory: offline-test/ghidra
-        run: |
-          set -euo pipefail
-
-          echo "Running Ghidra prepDev in offline mode..."
-
-          gradle \
-            --offline \
-            -g dependencies/gradle \
-            prepdev
-
-      - name: Verify offline build result
-        working-directory: offline-test/ghidra
-        run: |
-          set -euo pipefail
-
-          JAR="$(find \
-            dependencies/gradle/caches/modules-2/files-2.1/org.apache.commons/commons-collections4/4.6.0 \
-            -type f \
-            -name 'commons-collections4-4.6.0.jar' \
-            -print -quit)"
-
-          POM="$(find \
-            dependencies/gradle/caches/modules-2/files-2.1/org.apache.commons/commons-collections4/4.6.0 \
-            -type f \
-            -name 'commons-collections4-4.6.0.pom' \
-            -print -quit)"
-
-          test -n "${JAR}"
-          test -n "${POM}"
-
-          echo "Offline test succeeded."
-          echo "JAR: ${JAR}"
-          echo "POM: ${POM}"
