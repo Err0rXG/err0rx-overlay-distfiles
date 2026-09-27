@@ -1,4 +1,4 @@
-name: Check Ghidra release
+name: Build Ghidra dependencies
 
 on:
   workflow_dispatch:
