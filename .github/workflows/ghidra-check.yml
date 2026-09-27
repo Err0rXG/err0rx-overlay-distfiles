@@ -109,6 +109,11 @@ jobs:
 
           echo "Ghidra source verification passed."
 
+      - name: Test Gradle output
+        run: |
+          echo "Gradle minimum output = '${{ steps.source.outputs.gradle_min }}'"
+          echo "Gradle maximum output = '${{ steps.source.outputs.gradle_max }}'"
+
       - name: Show source contents
         run: |
           du -sh source/ghidra
