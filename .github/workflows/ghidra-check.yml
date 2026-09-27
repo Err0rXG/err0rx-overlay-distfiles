@@ -117,8 +117,9 @@ jobs:
 
           echo "Ghidra source verification passed."
 
-      - name: Test Gradle output
+      - name: Test Java & Gradle version output
         run: |
+          echo "Java Version output = '${{ steps.source.outputs.java_version }}'"
           echo "Gradle minimum output = '${{ steps.source.outputs.gradle_min }}'"
           echo "Gradle maximum output = '${{ steps.source.outputs.gradle_max }}'"
 
@@ -195,3 +196,36 @@ jobs:
 
           echo
           echo "Fetched dependency verification passed."
+
+      - name: Populate offline Gradle cache
+        working-directory: source/ghidra
+        run: |
+          set -euo pipefail
+
+          gradle -g dependencies/gradle prepdev
+
+      - name: Verify offline Gradle cache
+        working-directory: source/ghidra
+        run: |
+          set -euo pipefail
+
+          JAR="$(find \
+            dependencies/gradle/caches/modules-2/files-2.1/org.apache.commons/commons-collections4/4.6.0 \
+            -type f \
+            -name 'commons-collections4-4.6.0.jar' \
+            -print -quit)"
+
+          POM="$(find \
+            dependencies/gradle/caches/modules-2/files-2.1/org.apache.commons/commons-collections4/4.6.0 \
+            -type f \
+            -name 'commons-collections4-4.6.0.pom' \
+            -print -quit)"
+
+          test -n "${JAR}"
+          test -n "${POM}"
+
+          echo "Found JAR: ${JAR}"
+          echo "Found POM: ${POM}"
+
+          echo
+          echo "Offline Gradle cache verification passed."
