@@ -149,3 +149,10 @@ jobs:
           echo
           echo "Gradle:"
           gradle --version
+
+      - name: Fetch Ghidra dependencies
+        working-directory: source/ghidra
+        run: |
+          set -euo pipefail
+
+          gradle -I gradle/support/fetchDependencies.gradle
