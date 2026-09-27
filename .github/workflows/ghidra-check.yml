@@ -71,6 +71,7 @@ jobs:
             -C source/ghidra
 
       - name: Verify Ghidra source
+        id: source
         shell: bash
         env:
           TAG: ${{ steps.ghidra.outputs.tag }}
