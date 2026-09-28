@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "MovieBox-Tui version to process (example: 0.1.18). Leave empty to process all missing releases."
+        description: "MovieBox-Tui version to process (e.g., 0.1.18). Leave empty to auto-detect missing releases."
         required: false
         type: string
 
@@ -17,6 +17,7 @@ permissions:
 env:
   UPSTREAM_REPO: mesamirh/MovieBox-Tui
   DISTFILES_REPO: Err0rXG/err0rx-overlay-distfiles
+  MIN_VERSION: "v0.1.18"
 
 jobs:
   crates:
@@ -24,11 +25,11 @@ jobs:
 
     steps:
       - name: Set up Python
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@v5
         with:
-          python-version: ">=3.14"
+          python-version: "3.12"
 
-      - name: Install pycargoebuild
+      - name: Install Gentoo Portage & pycargoebuild
         shell: bash
         run: |
           set -euo pipefail
@@ -36,208 +37,161 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install portage 'pycargoebuild>=0.17.1'
 
-          echo "Python:"
-          python --version
+          echo "Python version: $(python --version)"
+          echo "Portage version: $(python -c 'import portage; print(portage.VERSION)')"
+          echo "pycargoebuild version: $(pycargoebuild --version 2>&1 || true)"
 
-          echo "Portage:"
-          python -c 'import portage; print(portage.VERSION)'
-
-          echo "pycargoebuild:"
-          #pycargoebuild --version
-
-      - name: Determine releases to build
+      - name: Determine target releases
         id: releases
         shell: bash
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.DISTFILES_PAT || secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
 
-          mkdir -p "${RUNNER_TEMP}/work"
+          WORKDIR="${RUNNER_TEMP}/work"
+          mkdir -p "${WORKDIR}"
 
-          MIN_VERSION="v0.1.18"
           INPUT_VERSION="${{ inputs.version }}"
 
           if [[ -n "${INPUT_VERSION}" ]]; then
+            INPUT_VERSION="${INPUT_VERSION#v}"
             REQUESTED_TAG="v${INPUT_VERSION}"
 
-            if [[ "${REQUESTED_TAG}" == "${MIN_VERSION}" ]] ||
-               printf '%s\n' "${REQUESTED_TAG}" "${MIN_VERSION}" |
-               sort -V |
-               tail -n1 |
-               grep -qx "${REQUESTED_TAG}"; then
+            HIGHEST=\((printf '%s\n%s\n' "\){REQUESTED_TAG}" "${MIN_VERSION}" | sort -V | tail -n1)
 
-              echo "Manual version requested: ${INPUT_VERSION}"
-              echo "versions=${REQUESTED_TAG}" >> "${GITHUB_OUTPUT}"
+            if [[ "\({REQUESTED_TAG}" == "\){MIN_VERSION}" ]] || [[ "\({HIGHEST}" == "\){REQUESTED_TAG}" ]]; then
+              echo "Manual version selected: ${REQUESTED_TAG}"
+              echo "versions=\({REQUESTED_TAG}" >> "\){GITHUB_OUTPUT}"
               exit 0
-
             else
-              echo "Requested version ${INPUT_VERSION} is below minimum ${MIN_VERSION}."
+              echo "Error: Requested version (\({REQUESTED_TAG}) is lower than minimum threshold (\){MIN_VERSION})." >&2
               exit 1
             fi
           fi
 
-          echo "Minimum MovieBox-Tui version: ${MIN_VERSION}"
-          echo
-          echo "Checking upstream releases..."
-
-          gh api --paginate \
-            "repos/${UPSTREAM_REPO}/releases?per_page=100" \
+          echo "Fetching upstream releases from ${UPSTREAM_REPO}..."
+          gh api --paginate "repos/${UPSTREAM_REPO}/releases?per_page=100" \
             --jq '.[].tag_name' |
-            grep '^v[0-9]' |
-            sort -V > "${RUNNER_TEMP}/work/all-upstream-releases.txt"
+            grep -E '^v[0-9]+\.[0-9]+\.[0-9]+' |
+            sort -V > "${WORKDIR}/upstream-all.txt"
 
-          if ! grep -Fxq "${MIN_VERSION}" \
-              "${RUNNER_TEMP}/work/all-upstream-releases.txt"; then
-            echo "Minimum version ${MIN_VERSION} was not found upstream."
+          if ! grep -Fxq "\({MIN_VERSION}" "\){WORKDIR}/upstream-all.txt"; then
+            echo "Error: Baseline version ${MIN_VERSION} not found upstream." >&2
             exit 1
           fi
 
-          awk -v min="${MIN_VERSION}" '
-            $0 == min { found=1 }
-            found
-          ' "${RUNNER_TEMP}/work/all-upstream-releases.txt" \
-            > "${RUNNER_TEMP}/work/upstream-releases.txt"
+          awk -v min="${MIN_VERSION}" '\(0 == min { found=1 } found' "\){WORKDIR}/upstream-all.txt" \
+            > "${WORKDIR}/upstream-eligible.txt"
 
-          echo "Upstream releases from ${MIN_VERSION}:"
-          cat "${RUNNER_TEMP}/work/upstream-releases.txt"
-
-          echo
-          echo "Checking existing distfile releases..."
-
-          gh api --paginate \
-            "repos/${DISTFILES_REPO}/releases?per_page=100" \
+          echo "Fetching existing distfile releases from ${DISTFILES_REPO}..."
+          gh api --paginate "repos/${DISTFILES_REPO}/releases?per_page=100" \
             --jq '.[].tag_name' |
-            grep '^moviebox-tui-[0-9]' |
-            sort -V > "${RUNNER_TEMP}/work/existing-releases.txt" || true
+            grep -E '^moviebox-tui-[0-9]' |
+            sort -V > "${WORKDIR}/existing-distfiles.txt" || true
 
-          echo "Existing distfile releases:"
-          cat "${RUNNER_TEMP}/work/existing-releases.txt" || true
-
-          : > "${RUNNER_TEMP}/work/missing-releases.txt"
+          : > "${WORKDIR}/missing-tags.txt"
 
           while read -r TAG; do
             [[ -n "${TAG}" ]] || continue
-
-            VERSION="${TAG#v}"
-
-            if ! grep -qx "moviebox-tui-${VERSION}" \
-                "${RUNNER_TEMP}/work/existing-releases.txt"; then
-              echo "${TAG}" >> "${RUNNER_TEMP}/work/missing-releases.txt"
+            VER="${TAG#v}"
+            if ! grep -qx "moviebox-tui-\({VER}" "\){WORKDIR}/existing-distfiles.txt"; then
+              echo "\({TAG}" >> "\){WORKDIR}/missing-tags.txt"
             fi
-          done < "${RUNNER_TEMP}/work/upstream-releases.txt"
+          done < "${WORKDIR}/upstream-eligible.txt"
 
-          echo
-          echo "Missing releases:"
-          cat "${RUNNER_TEMP}/work/missing-releases.txt" || true
+          MISSING_CSV=\((paste -sd, "\){WORKDIR}/missing-tags.txt" || true)
+          echo "Target releases to process: ${MISSING_CSV}"
+          echo "versions=\({MISSING_CSV}" >> "\){GITHUB_OUTPUT}"
 
-          VERSIONS="$(paste -sd, \
-            "${RUNNER_TEMP}/work/missing-releases.txt")"
-
-          echo "versions=${VERSIONS}" >> "${GITHUB_OUTPUT}"
-
-      - name: Build and publish crate tarballs
+      - name: Process and Publish Crate Distfiles
         if: steps.releases.outputs.versions != ''
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.DISTFILES_PAT || secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
 
-          WORKDIR="${RUNNER_TEMP}/moviebox-tui"
-          DISTDIR="${WORKDIR}/distfiles"
-          SOURCEDIR="${WORKDIR}/sources"
+          BASE_DIR="${RUNNER_TEMP}/moviebox-build"
+          DISTDIR="${BASE_DIR}/distfiles"
+          SOURCEDIR="${BASE_DIR}/sources"
+          CONFDIR="${BASE_DIR}/config"
 
-          mkdir -p "${DISTDIR}" "${SOURCEDIR}"
+          mkdir -p "\({DISTDIR}" "\){SOURCEDIR}" "${CONFDIR}"
+
+          # Dummy license mapping config to handle non-standard SPDX licenses gracefully
+          echo '[spdx-to-ebuild]' > "${CONFDIR}/license-mapping.conf"
 
           IFS=',' read -ra TAGS <<< "${{ steps.releases.outputs.versions }}"
 
           for TAG in "${TAGS[@]}"; do
             [[ -n "${TAG}" ]] || continue
-
             VERSION="${TAG#v}"
 
             PACKAGE="moviebox-tui-${VERSION}"
             RELEASE_TAG="moviebox-tui-${VERSION}"
+            SOURCE_ARCHIVE="\({SOURCEDIR}/\){PACKAGE}.tar.gz"
+            CRATE_TARBALL="\({DISTDIR}/\){PACKAGE}-crates.tar.xz"
+            EXTRACT_DIR="\({SOURCEDIR}/extract-\){VERSION}"
 
-            SOURCE_ARCHIVE="${SOURCEDIR}/${PACKAGE}.tar.gz"
-            SOURCE_DIR="${SOURCEDIR}/MovieBox-Tui-${VERSION}"
-            CRATE_TARBALL="${DISTDIR}/${PACKAGE}-crates.tar.xz"
+            echo "------------------------------------------------------------"
+            echo "Processing: \({PACKAGE} (Tag:\){TAG})"
+            echo "------------------------------------------------------------"
 
-            echo
-            echo "============================================================"
-            echo "MovieBox-Tui ${VERSION}"
-            echo "============================================================"
+            rm -rf "\({EXTRACT_DIR}" "\){SOURCE_ARCHIVE}" "${CRATE_TARBALL}"
+            mkdir -p "${EXTRACT_DIR}"
 
-            rm -rf "${SOURCE_DIR}"
-            rm -f "${SOURCE_ARCHIVE}" "${CRATE_TARBALL}"
-
-            echo "Downloading source..."
-
+            echo "Downloading upstream source tarball..."
             curl -fL --retry 5 --retry-delay 2 \
               -o "${SOURCE_ARCHIVE}" \
-              "https://github.com/${UPSTREAM_REPO}/archive/refs/tags/${TAG}.tar.gz"
+              "https://github.com/\({UPSTREAM_REPO}/archive/refs/tags/\){TAG}.tar.gz"
 
-            echo "Extracting source..."
+            echo "Extracting archive..."
+            tar -xzf "\({SOURCE_ARCHIVE}" -C "\){EXTRACT_DIR}" --strip-components=1
 
-            tar -xzf "${SOURCE_ARCHIVE}" \
-              -C "${SOURCEDIR}"
+            if [[ ! -f "\({EXTRACT_DIR}/Cargo.toml" || ! -f "\){EXTRACT_DIR}/Cargo.lock" ]]; then
+              echo "Error: Missing Cargo manifests in ${TAG}." >&2
+              exit 1
+            fi
 
-            test -f "${SOURCE_DIR}/Cargo.toml"
-            test -f "${SOURCE_DIR}/Cargo.lock"
-
-            echo "Generating crate tarball..."
-
-            printf '[spdx-to-ebuild]\n' \
-              > "${RUNNER_TEMP}/empty-license-mapping.conf"
-
+            echo "Generating crate archive via pycargoebuild..."
+            set +e
             pycargoebuild \
               -f \
               -w \
               -d "${DISTDIR}" \
-              -l "${RUNNER_TEMP}/empty-license-mapping.conf" \
+              -l "${CONFDIR}/license-mapping.conf" \
               --crate-tarball-path "${CRATE_TARBALL}" \
-              "${SOURCE_DIR}/"
+              "${EXTRACT_DIR}"
+            PYCARGO_STATUS=$?
+            set -e
 
-            #STATUS=$?
+            if [[ ${PYCARGO_STATUS} -ne 0 ]]; then
+              echo "Warning: pycargoebuild returned status ${PYCARGO_STATUS}."
+            fi
 
-            #set -e
+            if [[ ! -s "${CRATE_TARBALL}" ]]; then
+              echo "Error: Failed to generate crate archive ${CRATE_TARBALL}." >&2
+              exit 1
+            fi
 
-            #if [[ ${STATUS} -ne 0 ]]; then
-             # echo "pycargoebuild exited with status ${STATUS}."
-
-              #if [[ ! -s "${CRATE_TARBALL}" ]]; then
-                #echo "Crate tarball was not generated."
-                #exit "${STATUS}"
-              #fi
-
-              #echo "Crate tarball exists; ignoring license-processing failure."
-            #fi
-
-            test -s "${CRATE_TARBALL}"
-
-            echo
-            echo "Generated crate tarball:"
+            echo "Generated archive info:"
             ls -lh "${CRATE_TARBALL}"
 
-            echo
-            echo "Creating GitHub release: ${RELEASE_TAG}"
-
-            gh release create \
-              "${RELEASE_TAG}" \
-              "${CRATE_TARBALL}" \
+            echo "Publishing release \({RELEASE_TAG} to\){DISTFILES_REPO}..."
+            gh release create "\({RELEASE_TAG}" "\){CRATE_TARBALL}" \
               --repo "${DISTFILES_REPO}" \
               --title "MovieBox-Tui ${VERSION} crates" \
-              --notes "Cargo crate tarball for MovieBox-Tui ${VERSION}."
+              --notes "Automated Gentoo cargo vendor archive for MovieBox-Tui v${VERSION}."
 
-            echo
-            echo "Published:"
-            echo "https://github.com/${DISTFILES_REPO}/releases/tag/${RELEASE_TAG}"
+            echo "Successfully published: https://github.com/\({DISTFILES_REPO}/releases/tag/\){RELEASE_TAG}"
 
+            # Workspace cleanup per iteration
+            rm -rf "\({EXTRACT_DIR}" "\){SOURCE_ARCHIVE}"
           done
 
-      - name: Nothing to do
+      - name: Status Report
         if: steps.releases.outputs.versions == ''
         shell: bash
         run: |
-          echo "No missing MovieBox-Tui crate releases."
+          echo "No missing distfiles detected. Repositories are synchronized."
