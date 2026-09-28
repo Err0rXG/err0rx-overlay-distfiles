@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "MovieBox-Tui version to process (example: 0.1.18). Leave empty to process all missing releases."
+        description: "MovieBox-Tui version to process (example: 0.1.18). Leave empty to process all missing releases >= 0.1.18."
         required: false
         type: string
 
@@ -17,6 +17,7 @@ permissions:
 env:
   UPSTREAM_REPO: mesamirh/MovieBox-Tui
   DISTFILES_REPO: Err0rXG/err0rx-overlay-distfiles
+  MIN_VERSION: "0.1.18"
 
 jobs:
   crates:
@@ -24,11 +25,11 @@ jobs:
 
     steps:
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
-          python-version: "3.12"
+          python-version: ">=3.14"
 
-      - name: Install pycargoebuild
+      - name: Install build dependencies
         shell: bash
         run: |
           set -euo pipefail
@@ -43,65 +44,74 @@ jobs:
           python -c 'import portage; print(portage.VERSION)'
 
           echo "pycargoebuild:"
-          pycargoebuild --version 2>&1 || true
+          pycargoebuild --help >/dev/null
+          echo "pycargoebuild is available."
 
       - name: Determine releases to build
         id: releases
         shell: bash
         env:
-          GH_TOKEN: ${{ secrets.DISTFILES_PAT || secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
 
-          mkdir -p "${RUNNER_TEMP}/work"
+          WORKDIR="${RUNNER_TEMP}/work"
+          mkdir -p "${WORKDIR}"
 
-          MIN_VERSION="v0.1.18"
           INPUT_VERSION="${{ inputs.version }}"
 
+          #
+          # Manual version requested
+          #
           if [[ -n "${INPUT_VERSION}" ]]; then
-            INPUT_VERSION="${INPUT_VERSION#v}"
-            REQUESTED_TAG="v${INPUT_VERSION}"
+            REQUESTED_VERSION="${INPUT_VERSION}"
 
-            if [[ "\({REQUESTED_TAG}" == "\){MIN_VERSION}" ]] ||
-               printf '%s\n' "\({REQUESTED_TAG}" "\){MIN_VERSION}" |
-               sort -V |
-               tail -n1 |
-               grep -qx "${REQUESTED_TAG}"; then
-
-              echo "Manual version requested: ${INPUT_VERSION}"
-              echo "versions=\({REQUESTED_TAG}" >> "\){GITHUB_OUTPUT}"
-              exit 0
-            else
-              echo "Requested version \({INPUT_VERSION} is below minimum\){MIN_VERSION}."
+            if [[ "$(printf '%s\n' "${REQUESTED_VERSION}" "${MIN_VERSION}" | sort -V | head -n1)" != "${MIN_VERSION}" ]]; then
+              echo "Requested version ${REQUESTED_VERSION} is below minimum ${MIN_VERSION}."
               exit 1
             fi
+
+            echo "Manual version requested: ${REQUESTED_VERSION}"
+            echo "versions=v${REQUESTED_VERSION}" >> "${GITHUB_OUTPUT}"
+            exit 0
           fi
 
+          #
+          # Get all upstream releases
+          #
           echo "Minimum MovieBox-Tui version: ${MIN_VERSION}"
-          echo
           echo "Checking upstream releases..."
 
           gh api --paginate \
             "repos/${UPSTREAM_REPO}/releases?per_page=100" \
             --jq '.[].tag_name' |
             grep '^v[0-9]' |
-            sort -V > "${RUNNER_TEMP}/work/all-upstream-releases.txt"
+            sort -V > "${WORKDIR}/all-upstream-releases.txt"
 
-          if ! grep -Fxq "${MIN_VERSION}" \
-              "${RUNNER_TEMP}/work/all-upstream-releases.txt"; then
-            echo "Minimum version ${MIN_VERSION} was not found upstream."
-            exit 1
-          fi
+          #
+          # Keep only releases >= MIN_VERSION
+          #
+          MIN_TAG="v${MIN_VERSION}"
 
-          awk -v min="${MIN_VERSION}" '
+          awk -v min="${MIN_TAG}" '
             $0 == min { found=1 }
             found
-          ' "${RUNNER_TEMP}/work/all-upstream-releases.txt" \
-            > "${RUNNER_TEMP}/work/upstream-releases.txt"
+          ' "${WORKDIR}/all-upstream-releases.txt" \
+            > "${WORKDIR}/upstream-releases.txt"
 
-          echo "Upstream releases from ${MIN_VERSION}:"
-          cat "${RUNNER_TEMP}/work/upstream-releases.txt"
+          if [[ ! -s "${WORKDIR}/upstream-releases.txt" ]]; then
+            echo "No upstream releases >= ${MIN_VERSION} found."
+            echo "versions=" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
 
+          echo
+          echo "Upstream releases from ${MIN_TAG}:"
+          cat "${WORKDIR}/upstream-releases.txt"
+
+          #
+          # Get releases already published in our distfiles repository
+          #
           echo
           echo "Checking existing distfile releases..."
 
@@ -109,37 +119,40 @@ jobs:
             "repos/${DISTFILES_REPO}/releases?per_page=100" \
             --jq '.[].tag_name' |
             grep '^moviebox-tui-[0-9]' |
-            sort -V > "${RUNNER_TEMP}/work/existing-releases.txt" || true
+            sort -V > "${WORKDIR}/existing-releases.txt" || true
 
           echo "Existing distfile releases:"
-          cat "${RUNNER_TEMP}/work/existing-releases.txt" || true
+          cat "${WORKDIR}/existing-releases.txt" || true
 
-          : > "${RUNNER_TEMP}/work/missing-releases.txt"
+          #
+          # Find missing releases
+          #
+          : > "${WORKDIR}/missing-releases.txt"
 
           while read -r TAG; do
             [[ -n "${TAG}" ]] || continue
 
             VERSION="${TAG#v}"
+            RELEASE_TAG="moviebox-tui-${VERSION}"
 
-            if ! grep -qx "moviebox-tui-${VERSION}" \
-                "${RUNNER_TEMP}/work/existing-releases.txt"; then
-              echo "\({TAG}" >> "\){RUNNER_TEMP}/work/missing-releases.txt"
+            if ! grep -Fxq "${RELEASE_TAG}" \
+                "${WORKDIR}/existing-releases.txt"; then
+              echo "${TAG}" >> "${WORKDIR}/missing-releases.txt"
             fi
-          done < "${RUNNER_TEMP}/work/upstream-releases.txt"
+          done < "${WORKDIR}/upstream-releases.txt"
 
           echo
           echo "Missing releases:"
-          cat "${RUNNER_TEMP}/work/missing-releases.txt" || true
+          cat "${WORKDIR}/missing-releases.txt" || true
 
-          VERSIONS="$(paste -sd, \
-            "${RUNNER_TEMP}/work/missing-releases.txt")"
+          VERSIONS="$(paste -sd, "${WORKDIR}/missing-releases.txt")"
 
           echo "versions=${VERSIONS}" >> "${GITHUB_OUTPUT}"
 
       - name: Build and publish crate tarballs
         if: steps.releases.outputs.versions != ''
         env:
-          GH_TOKEN: ${{ secrets.DISTFILES_PAT || secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
@@ -148,7 +161,7 @@ jobs:
           DISTDIR="${WORKDIR}/distfiles"
           SOURCEDIR="${WORKDIR}/sources"
 
-          mkdir -p "\({DISTDIR}" "\){SOURCEDIR}"
+          mkdir -p "${DISTDIR}" "${SOURCEDIR}"
 
           IFS=',' read -ra TAGS <<< "${{ steps.releases.outputs.versions }}"
 
@@ -160,9 +173,9 @@ jobs:
             PACKAGE="moviebox-tui-${VERSION}"
             RELEASE_TAG="moviebox-tui-${VERSION}"
 
-            SOURCE_ARCHIVE="\({SOURCEDIR}/\){PACKAGE}.tar.gz"
-            SOURCE_DIR="\({SOURCEDIR}/MovieBox-Tui-\){VERSION}"
-            CRATE_TARBALL="\({DISTDIR}/\){PACKAGE}-crates.tar.xz"
+            SOURCE_ARCHIVE="${SOURCEDIR}/${PACKAGE}.tar.gz"
+            SOURCE_DIR="${SOURCEDIR}/MovieBox-Tui-${VERSION}"
+            CRATE_TARBALL="${DISTDIR}/${PACKAGE}-crates.tar.xz"
 
             echo
             echo "============================================================"
@@ -170,13 +183,14 @@ jobs:
             echo "============================================================"
 
             rm -rf "${SOURCE_DIR}"
-            rm -f "\({SOURCE_ARCHIVE}" "\){CRATE_TARBALL}"
+            rm -f "${SOURCE_ARCHIVE}"
+            rm -f "${CRATE_TARBALL}"
 
             echo "Downloading source..."
 
             curl -fL --retry 5 --retry-delay 2 \
               -o "${SOURCE_ARCHIVE}" \
-              "https://github.com/\({UPSTREAM_REPO}/archive/refs/tags/\){TAG}.tar.gz"
+              "https://github.com/${UPSTREAM_REPO}/archive/refs/tags/${TAG}.tar.gz"
 
             echo "Extracting source..."
 
@@ -188,41 +202,65 @@ jobs:
 
             echo "Generating crate tarball..."
 
-            # Temporarily disable pipefail exit to capture pycargoebuild return status
-            set +e
+            PYCARGO_STATUS=0
+
             pycargoebuild \
               -f \
               -w \
               -d "${DISTDIR}" \
               --crate-tarball-path "${CRATE_TARBALL}" \
-              "${SOURCE_DIR}/"
-            STATUS=$?
-            set -e
+              "${SOURCE_DIR}/" || PYCARGO_STATUS=$?
 
-            if [[ ${STATUS} -ne 0 ]]; then
-              echo "::warning::pycargoebuild exited with status ${STATUS} (likely ebuild license-mapping related)."
+            #
+            # pycargoebuild 0.17.1 writes the crate tarball before
+            # entering its license-processing stage. On the GitHub
+            # runner there is no Gentoo repository/license mapping,
+            # so that later stage can return non-zero.
+            #
+            if [[ ! -s "${CRATE_TARBALL}" ]]; then
+              echo "ERROR: crate tarball was not generated."
+              exit "${PYCARGO_STATUS}"
             fi
 
-            # Ensure crate tarball was actually generated before proceeding to upload
-            test -s "${CRATE_TARBALL}"
+            if [[ "${PYCARGO_STATUS}" -ne 0 ]]; then
+              echo
+              echo "pycargoebuild exited with status ${PYCARGO_STATUS},"
+              echo "but the crate tarball was successfully generated."
+              echo "Continuing."
+            fi
 
             echo
-            echo "Generated crate tarball:"
+            echo "Crate tarball:"
             ls -lh "${CRATE_TARBALL}"
 
             echo
-            echo "Creating GitHub release: ${RELEASE_TAG}"
+            echo "Publishing release ${RELEASE_TAG}..."
 
-            gh release create \
-              "${RELEASE_TAG}" \
-              "${CRATE_TARBALL}" \
-              --repo "${DISTFILES_REPO}" \
-              --title "MovieBox-Tui ${VERSION} crates" \
-              --notes "Cargo crate tarball for MovieBox-Tui ${VERSION}."
+            if gh release view "${RELEASE_TAG}" \
+                --repo "${DISTFILES_REPO}" >/dev/null 2>&1; then
+
+              echo "Release already exists. Uploading asset..."
+
+              gh release upload \
+                "${RELEASE_TAG}" \
+                "${CRATE_TARBALL}" \
+                --repo "${DISTFILES_REPO}" \
+                --clobber
+
+            else
+
+              gh release create \
+                "${RELEASE_TAG}" \
+                "${CRATE_TARBALL}" \
+                --repo "${DISTFILES_REPO}" \
+                --title "MovieBox-Tui ${VERSION} crates" \
+                --notes "Cargo crate tarball for MovieBox-Tui ${VERSION}."
+
+            fi
 
             echo
             echo "Published:"
-            echo "https://github.com/\({DISTFILES_REPO}/releases/tag/\){RELEASE_TAG}"
+            echo "https://github.com/${DISTFILES_REPO}/releases/tag/${RELEASE_TAG}"
 
           done
 
@@ -230,4 +268,4 @@ jobs:
         if: steps.releases.outputs.versions == ''
         shell: bash
         run: |
-          echo "No missing MovieBox-Tui crate releases."
+          echo "No missing MovieBox-Tui releases >= ${MIN_VERSION}."
