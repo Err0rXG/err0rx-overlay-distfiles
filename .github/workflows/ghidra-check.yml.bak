@@ -1,0 +1,312 @@
+name: Check Ghidra release
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 4 * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check latest Ghidra release
+        id: ghidra
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TAG="$(curl -fsSL \
+            https://api.github.com/repos/NationalSecurityAgency/ghidra/releases/latest \
+            | jq -r '.tag_name')"
+
+          VERSION="${TAG#Ghidra_}"
+          VERSION="${VERSION%_build}"
+
+          OUR_RELEASE="ghidra-${VERSION}"
+
+          echo "Upstream tag  : ${TAG}"
+          echo "Ghidra version: ${VERSION}"
+          echo "Our release   : ${OUR_RELEASE}"
+
+          STATUS="$(curl -s -o /dev/null -w '%{http_code}' \
+            "https://api.github.com/repos/Err0rXG/err0rx-overlay-distfiles/releases/tags/${OUR_RELEASE}")"
+
+          echo "Our release HTTP status: ${STATUS}"
+
+          if [[ "${STATUS}" == "200" ]]; then
+            echo "Distfile release already exists."
+          elif [[ "${STATUS}" == "404" ]]; then
+            echo "Distfile release does not exist yet."
+          else
+            echo "Unexpected GitHub API status: ${STATUS}"
+            exit 1
+          fi
+
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Download Ghidra source
+        shell: bash
+        env:
+          TAG: ${{ steps.ghidra.outputs.tag }}
+          VERSION: ${{ steps.ghidra.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p source
+
+          echo "Downloading Ghidra ${VERSION} (${TAG})..."
+
+          curl -fL \
+            "https://github.com/NationalSecurityAgency/ghidra/archive/refs/tags/${TAG}.tar.gz" \
+            -o source/ghidra.tar.gz
+
+          echo "Extracting source..."
+
+          mkdir -p source/ghidra
+
+          tar -xzf source/ghidra.tar.gz \
+            --strip-components=1 \
+            -C source/ghidra
+
+      - name: Verify Ghidra source
+        id: source
+        shell: bash
+        env:
+          TAG: ${{ steps.ghidra.outputs.tag }}
+          VERSION: ${{ steps.ghidra.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          echo "Checking extracted source..."
+
+          test -f source/ghidra/Ghidra/application.properties
+          test -f source/ghidra/gradlew
+          test -f source/ghidra/gradle/support/fetchDependencies.gradle
+
+          SOURCE_VERSION="$(sed -n \
+            's/^application.version=//p' \
+            source/ghidra/Ghidra/application.properties)"
+
+          GRADLE_MIN="$(sed -n \
+            's/^application.gradle.min=//p' \
+            source/ghidra/Ghidra/application.properties)"
+
+          GRADLE_MAX="$(sed -n \
+            's/^application.gradle.max=//p' \
+            source/ghidra/Ghidra/application.properties)"
+
+          JAVA_VERSION="$(sed -n \
+            's/^application.java.compiler=//p' \
+            source/ghidra/Ghidra/application.properties)"
+
+          echo "Expected version: ${VERSION}"
+          echo "Source version:   ${SOURCE_VERSION}"
+          echo "Java compiler:    ${JAVA_VERSION}"
+          echo "Gradle minimum:   ${GRADLE_MIN}"
+          echo "Gradle maximum:   ${GRADLE_MAX:-none}"
+
+          test "${SOURCE_VERSION}" = "${VERSION}"
+          test -n "${JAVA_VERSION}"
+          test -n "${GRADLE_MIN}"
+
+          echo "java_version=${JAVA_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "gradle_min=${GRADLE_MIN}" >> "$GITHUB_OUTPUT"
+          echo "gradle_max=${GRADLE_MAX}" >> "$GITHUB_OUTPUT"
+
+          echo "Ghidra source verification passed."
+
+      - name: Test Java & Gradle version output
+        run: |
+          echo "Java Version output = '${{ steps.source.outputs.java_version }}'"
+          echo "Gradle minimum output = '${{ steps.source.outputs.gradle_min }}'"
+          echo "Gradle maximum output = '${{ steps.source.outputs.gradle_max }}'"
+
+      - name: Show source contents
+        run: |
+          du -sh source/ghidra
+          ls -la source/ghidra
+
+      - name: Set up Java
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "${{ steps.source.outputs.java_version }}"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: "${{ steps.source.outputs.gradle_min }}"
+
+      - name: Verify build environment
+        working-directory: source/ghidra
+        run: |
+          set -euo pipefail
+
+          echo "Java:"
+          java --version
+
+          echo
+          echo "Gradle:"
+          gradle --version
+
+      - name: Fetch Ghidra dependencies
+        working-directory: source/ghidra
+        run: |
+          set -euo pipefail
+
+          gradle -I gradle/support/fetchDependencies.gradle
+
+      - name: Verify fetched dependencies
+        working-directory: source/ghidra
+        run: |
+          set -euo pipefail
+
+          echo "Dependency directory:"
+          du -sh dependencies
+
+          echo
+          echo "Top-level directories:"
+          find dependencies -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort
+
+          echo
+          echo "Key dependency checks:"
+
+          test -f dependencies/flatRepo/java-sarif-2.1-modified.jar
+          echo "  ✓ java-sarif"
+
+          test -f dependencies/Debugger-agent-dbgeng/pybag-2.2.16-py3-none-any.whl
+          echo "  ✓ pybag 2.2.16"
+
+          test -f dependencies/Debugger-agent-dbgeng/capstone-5.0.6-py3-none-win_amd64.whl
+          echo "  ✓ capstone 5.0.6"
+
+          test -f dependencies/Debugger-agent-dbgeng/comtypes-1.4.13-py3-none-any.whl
+          echo "  ✓ comtypes 1.4.13"
+
+          test -f dependencies/Debugger-rmi-trace/protobuf-6.31.0-py3-none-any.whl
+          echo "  ✓ protobuf 6.31.0"
+
+          test -d dependencies/fidb
+          echo "  ✓ FunctionID databases"
+
+          test -d dependencies/SymbolicSummaryZ3
+          echo "  ✓ Z3"
+
+          echo
+          echo "Fetched dependency verification passed."
+
+      - name: Populate offline Gradle cache
+        working-directory: source/ghidra
+        run: |
+          set -euo pipefail
+
+          gradle -g dependencies/gradle prepdev
+
+      - name: Verify offline Gradle cache
+        working-directory: source/ghidra
+        run: |
+          set -euo pipefail
+
+          JAR="$(find \
+            dependencies/gradle/caches/modules-2/files-2.1/org.apache.commons/commons-collections4/4.6.0 \
+            -type f \
+            -name 'commons-collections4-4.6.0.jar' \
+            -print -quit)"
+
+          POM="$(find \
+            dependencies/gradle/caches/modules-2/files-2.1/org.apache.commons/commons-collections4/4.6.0 \
+            -type f \
+            -name 'commons-collections4-4.6.0.pom' \
+            -print -quit)"
+
+          test -n "${JAR}"
+          test -n "${POM}"
+
+          echo "Found JAR: ${JAR}"
+          echo "Found POM: ${POM}"
+
+          echo
+          echo "Offline Gradle cache verification passed."
+
+
+      - name: Create dependency archive
+        working-directory: source/ghidra
+        env:
+          VERSION: ${{ steps.ghidra.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          tar -czf \
+            "../../ghidra-dependencies-${VERSION}.tar.gz" \
+            dependencies
+
+          sha256sum \
+            "../../ghidra-dependencies-${VERSION}.tar.gz"
+
+          ls -lh \
+            "../../ghidra-dependencies-${VERSION}.tar.gz"
+
+      - name: Prepare clean offline test tree
+        env:
+          VERSION: ${{ steps.ghidra.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          rm -rf offline-test
+          mkdir -p offline-test/ghidra
+
+          tar -xzf source/ghidra.tar.gz \
+            --strip-components=1 \
+            -C offline-test/ghidra
+
+          tar -xzf \
+            "ghidra-dependencies-${VERSION}.tar.gz" \
+            -C offline-test/ghidra
+
+          echo "Clean source:"
+          du -sh offline-test/ghidra
+
+          echo
+          echo "Extracted dependencies:"
+          du -sh offline-test/ghidra/dependencies
+
+      - name: Test Ghidra completely offline
+        working-directory: offline-test/ghidra
+        run: |
+          set -euo pipefail
+
+          echo "Running Ghidra prepDev in offline mode..."
+
+          gradle \
+            --offline \
+            -g dependencies/gradle \
+            prepdev
+
+      - name: Verify offline build result
+        working-directory: offline-test/ghidra
+        run: |
+          set -euo pipefail
+
+          JAR="$(find \
+            dependencies/gradle/caches/modules-2/files-2.1/org.apache.commons/commons-collections4/4.6.0 \
+            -type f \
+            -name 'commons-collections4-4.6.0.jar' \
+            -print -quit)"
+
+          POM="$(find \
+            dependencies/gradle/caches/modules-2/files-2.1/org.apache.commons/commons-collections4/4.6.0 \
+            -type f \
+            -name 'commons-collections4-4.6.0.pom' \
+            -print -quit)"
+
+          test -n "${JAR}"
+          test -n "${POM}"
+
+          echo "Offline test succeeded."
+          echo "JAR: ${JAR}"
+          echo "POM: ${POM}"
