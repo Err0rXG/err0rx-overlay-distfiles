@@ -39,6 +39,9 @@ jobs:
           echo "Python:"
           python --version
 
+          echo "Portage:"
+          python -c 'import portage; print(portage.VERSION)'
+
           echo "pycargoebuild:"
           #pycargoebuild --version
 
