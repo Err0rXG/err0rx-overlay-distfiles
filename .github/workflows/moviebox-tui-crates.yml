@@ -204,12 +204,23 @@ jobs:
 
             PYCARGO_STATUS=0
 
+            curl -fL --retry 5 --retry-delay 2 \
+              -o "${RUNNER_TEMP}/license-mapping.conf" \
+              "https://raw.githubusercontent.com/gentoo/gentoo/master/metadata/license-mapping.conf"
+
             pycargoebuild \
               -f \
               -w \
+              -L \
               -d "${DISTDIR}" \
+              -l "${RUNNER_TEMP}/license-mapping.conf" \
               --crate-tarball-path "${CRATE_TARBALL}" \
               "${SOURCE_DIR}/" || PYCARGO_STATUS=$?
+
+            test -s "${CRATE_TARBALL}"
+
+            echo "Crate tarball successfully generated:"
+            ls -lh "${CRATE_TARBALL}"
 
             #
             # pycargoebuild 0.17.1 writes the crate tarball before
