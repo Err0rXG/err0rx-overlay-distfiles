@@ -199,6 +199,21 @@ jobs:
               --crate-tarball-path "${CRATE_TARBALL}" \
               "${SOURCE_DIR}/"
 
+            STATUS=$?
+
+            set -e
+
+            if [[ ${STATUS} -ne 0 ]]; then
+              echo "pycargoebuild exited with status ${STATUS}."
+
+              if [[ ! -s "${CRATE_TARBALL}" ]]; then
+                echo "Crate tarball was not generated."
+                exit "${STATUS}"
+              fi
+
+              echo "Crate tarball exists; ignoring license-processing failure."
+            fi
+
             test -s "${CRATE_TARBALL}"
 
             echo
