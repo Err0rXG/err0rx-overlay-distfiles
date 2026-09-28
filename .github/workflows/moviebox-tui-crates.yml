@@ -55,23 +55,51 @@ jobs:
 
           mkdir -p "${RUNNER_TEMP}/work"
 
+          MIN_VERSION="v0.1.18"
           INPUT_VERSION="${{ inputs.version }}"
 
           if [[ -n "${INPUT_VERSION}" ]]; then
-            echo "Manual version requested: ${INPUT_VERSION}"
-            echo "versions=v${INPUT_VERSION}" >> "${GITHUB_OUTPUT}"
-            exit 0
+            REQUESTED_TAG="v${INPUT_VERSION}"
+
+            if [[ "${REQUESTED_TAG}" == "${MIN_VERSION}" ]] ||
+               printf '%s\n' "${REQUESTED_TAG}" "${MIN_VERSION}" |
+               sort -V |
+               tail -n1 |
+               grep -qx "${REQUESTED_TAG}"; then
+
+              echo "Manual version requested: ${INPUT_VERSION}"
+              echo "versions=${REQUESTED_TAG}" >> "${GITHUB_OUTPUT}"
+              exit 0
+
+            else
+              echo "Requested version ${INPUT_VERSION} is below minimum ${MIN_VERSION}."
+              exit 1
+            fi
           fi
 
+          echo "Minimum MovieBox-Tui version: ${MIN_VERSION}"
+          echo
           echo "Checking upstream releases..."
 
           gh api --paginate \
             "repos/${UPSTREAM_REPO}/releases?per_page=100" \
             --jq '.[].tag_name' |
             grep '^v[0-9]' |
-            sort -V > "${RUNNER_TEMP}/work/upstream-releases.txt"
+            sort -V > "${RUNNER_TEMP}/work/all-upstream-releases.txt"
 
-          echo "Upstream releases:"
+          if ! grep -Fxq "${MIN_VERSION}" \
+              "${RUNNER_TEMP}/work/all-upstream-releases.txt"; then
+            echo "Minimum version ${MIN_VERSION} was not found upstream."
+            exit 1
+          fi
+
+          awk -v min="${MIN_VERSION}" '
+            $0 == min { found=1 }
+            found
+          ' "${RUNNER_TEMP}/work/all-upstream-releases.txt" \
+            > "${RUNNER_TEMP}/work/upstream-releases.txt"
+
+          echo "Upstream releases from ${MIN_VERSION}:"
           cat "${RUNNER_TEMP}/work/upstream-releases.txt"
 
           echo
@@ -103,7 +131,8 @@ jobs:
           echo "Missing releases:"
           cat "${RUNNER_TEMP}/work/missing-releases.txt" || true
 
-          VERSIONS="$(paste -sd, "${RUNNER_TEMP}/work/missing-releases.txt")"
+          VERSIONS="$(paste -sd, \
+            "${RUNNER_TEMP}/work/missing-releases.txt")"
 
           echo "versions=${VERSIONS}" >> "${GITHUB_OUTPUT}"
 
