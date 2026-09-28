@@ -40,7 +40,7 @@ jobs:
           python --version
 
           echo "pycargoebuild:"
-          pycargoebuild --version
+          #pycargoebuild --version
 
       - name: Determine releases to build
         id: releases
