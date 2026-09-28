@@ -195,7 +195,7 @@ jobs:
               -f \
               -w \
               -d "${DISTDIR}" \
-              #-l "${RUNNER_TEMP}/empty-license-mapping.conf" \
+              -l "${RUNNER_TEMP}/empty-license-mapping.conf" \
               --crate-tarball-path "${CRATE_TARBALL}" \
               "${SOURCE_DIR}/"
 
