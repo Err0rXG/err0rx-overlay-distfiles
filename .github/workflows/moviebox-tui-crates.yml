@@ -188,8 +188,8 @@ jobs:
 
             echo "Generating crate tarball..."
 
-            #printf '[spdx-to-ebuild]\n' \
-              #> "${RUNNER_TEMP}/empty-license-mapping.conf"
+            printf '[spdx-to-ebuild]\n' \
+              > "${RUNNER_TEMP}/empty-license-mapping.conf"
 
             pycargoebuild \
               -f \
