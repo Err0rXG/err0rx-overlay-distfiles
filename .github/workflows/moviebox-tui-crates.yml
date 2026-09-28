@@ -159,6 +159,8 @@ jobs:
 
             echo "Generating crate tarball..."
 
+            touch "${RUNNER_TEMP}/empty-license-mapping.conf"
+
             pycargoebuild \
               -f \
               -w \
