@@ -71,7 +71,6 @@ jobs:
               echo "Manual version requested: ${INPUT_VERSION}"
               echo "versions=\({REQUESTED_TAG}" >> "\){GITHUB_OUTPUT}"
               exit 0
-
             else
               echo "Requested version \({INPUT_VERSION} is below minimum\){MIN_VERSION}."
               exit 1
