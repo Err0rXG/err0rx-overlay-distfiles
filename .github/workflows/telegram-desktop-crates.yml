@@ -1,0 +1,421 @@
+name: Telegram-Desktop Crate Distfiles
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Telegram Desktop version to process (example: 7.3.3). Leave empty to process all missing stable releases >= MIN_VERSION."
+        required: false
+        type: string
+
+  schedule:
+    - cron: "30 3 * * *"
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM_REPO: telegramdesktop/tdesktop
+  DISTFILES_REPO: Err0rXG/err0rx-overlay-distfiles
+  PACKAGE: telegram-desktop
+  MIN_VERSION: "7.3.3"
+
+jobs:
+  crates:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: ">=3.14"
+
+      - name: Update Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # tdesktop_rust uses edition 2024, so a recent cargo is required.
+          rustup update stable --no-self-update
+          rustup default stable
+
+          cargo --version
+          rustc --version
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python -m pip install --upgrade pip
+          python -m pip install portage 'pycargoebuild>=0.17.1'
+
+          echo "Python:"
+          python --version
+
+          echo "pycargoebuild:"
+          pycargoebuild --help >/dev/null
+          echo "pycargoebuild is available."
+
+      - name: Determine releases to build
+        id: releases
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+
+          WORKDIR="${RUNNER_TEMP}/work"
+          mkdir -p "${WORKDIR}"
+
+          # version_ge A B: true if A >= B (version sort).
+          version_ge() {
+            [[ "$(printf '%s\n' "$1" "$2" | sort -V | head -n1)" == "$2" ]]
+          }
+
+          #
+          # Manual version requested
+          #
+          INPUT_VERSION="${INPUT_VERSION#v}"
+
+          if [[ -n "${INPUT_VERSION}" ]]; then
+            if [[ ! "${INPUT_VERSION}" =~ ^[0-9]+(\.[0-9]+)+$ ]]; then
+              echo "Invalid version: ${INPUT_VERSION}"
+              exit 1
+            fi
+
+            if ! version_ge "${INPUT_VERSION}" "${MIN_VERSION}"; then
+              echo "Requested version ${INPUT_VERSION} is below minimum ${MIN_VERSION}."
+              exit 1
+            fi
+
+            echo "Manual version requested: ${INPUT_VERSION}"
+            echo "versions=v${INPUT_VERSION}" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          #
+          # Newest stable upstream releases (drafts and pre-releases skipped).
+          # The first page (100 newest releases) is plenty for a daily job.
+          #
+          echo "Minimum Telegram Desktop version: ${MIN_VERSION}"
+          echo "Checking upstream releases..."
+
+          gh api "repos/${UPSTREAM_REPO}/releases?per_page=100" \
+            --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name' |
+            { grep -E '^v[0-9]+(\.[0-9]+)+$' || true; } |
+            sort -Vu > "${WORKDIR}/all-upstream-releases.txt"
+
+          : > "${WORKDIR}/upstream-releases.txt"
+
+          while read -r TAG; do
+            [[ -n "${TAG}" ]] || continue
+
+            if version_ge "${TAG#v}" "${MIN_VERSION}"; then
+              echo "${TAG}" >> "${WORKDIR}/upstream-releases.txt"
+            fi
+          done < "${WORKDIR}/all-upstream-releases.txt"
+
+          if [[ ! -s "${WORKDIR}/upstream-releases.txt" ]]; then
+            echo "No stable upstream releases >= ${MIN_VERSION} found."
+            echo "versions=" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          echo
+          echo "Upstream stable releases >= ${MIN_VERSION}:"
+          cat "${WORKDIR}/upstream-releases.txt"
+
+          #
+          # Releases already published in our distfiles repository
+          #
+          echo
+          echo "Checking existing distfile releases..."
+
+          gh api --paginate \
+            "repos/${DISTFILES_REPO}/releases?per_page=100" \
+            --jq '.[].tag_name' |
+            { grep "^${PACKAGE}-[0-9]" || true; } |
+            sort -V > "${WORKDIR}/existing-releases.txt"
+
+          echo "Existing distfile releases:"
+          cat "${WORKDIR}/existing-releases.txt"
+
+          #
+          # Find missing releases
+          #
+          : > "${WORKDIR}/missing-releases.txt"
+
+          while read -r TAG; do
+            [[ -n "${TAG}" ]] || continue
+
+            RELEASE_TAG="${PACKAGE}-${TAG#v}"
+
+            if ! grep -Fxq "${RELEASE_TAG}" \
+                "${WORKDIR}/existing-releases.txt"; then
+              echo "${TAG}" >> "${WORKDIR}/missing-releases.txt"
+            fi
+          done < "${WORKDIR}/upstream-releases.txt"
+
+          echo
+          echo "Missing releases:"
+          cat "${WORKDIR}/missing-releases.txt"
+
+          VERSIONS="$(paste -sd, "${WORKDIR}/missing-releases.txt")"
+
+          echo "versions=${VERSIONS}" >> "${GITHUB_OUTPUT}"
+
+      - name: Build and publish crate tarballs
+        if: steps.releases.outputs.versions != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSIONS: ${{ steps.releases.outputs.versions }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          WORKDIR="${RUNNER_TEMP}/tdesktop"
+          mkdir -p "${WORKDIR}"
+
+          export CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS=allow
+
+          # pycargoebuild opens the license mapping even when licenses are
+          # not wanted, and there is no Gentoo repository on the runner.
+          curl -fL --retry 5 --retry-delay 2 \
+            -o "${WORKDIR}/license-mapping.conf" \
+            "https://raw.githubusercontent.com/gentoo/gentoo/master/metadata/license-mapping.conf"
+
+          AUTH=()
+          if [[ -n "${GH_TOKEN:-}" ]]; then
+            AUTH=(-H "Authorization: Bearer ${GH_TOKEN}")
+          fi
+
+          IFS=',' read -ra TAGS <<< "${VERSIONS}"
+
+          for TAG in "${TAGS[@]}"; do
+            [[ -n "${TAG}" ]] || continue
+
+            VERSION="${TAG#v}"
+            RELEASE_TAG="${PACKAGE}-${VERSION}"
+
+            BUILD="${WORKDIR}/${VERSION}"
+            DISTDIR="${BUILD}/dist"
+            CRATE_TARBALL="${DISTDIR}/${PACKAGE}-${VERSION}-crates.tar.xz"
+
+            echo
+            echo "============================================================"
+            echo "Telegram Desktop ${VERSION}"
+            echo "============================================================"
+
+            rm -rf "${BUILD}"
+            mkdir -p "${DISTDIR}"
+            cd "${BUILD}"
+
+            #
+            # Revisions pinned by upstream for the Rust parts
+            #
+            echo "Reading pinned revisions from prepare.py..."
+
+            curl -fsSL --retry 5 --retry-delay 2 \
+              -o prepare.py \
+              "https://raw.githubusercontent.com/${UPSTREAM_REPO}/${TAG}/Telegram/build/prepare/prepare.py"
+
+            TLOTTIE_SHORT="$(sed -n "s/^tlottieRevision = '\([0-9a-f]*\)'.*/\1/p" prepare.py)"
+            WALLET_COMMIT="$(sed -n "s/^walletEngineRevision = '\([0-9a-f]*\)'.*/\1/p" prepare.py)"
+            PATCHES_COMMIT="$(awk '/^stage\(.patches./ { f = 1 } f && /git checkout/ { print $3; exit }' prepare.py)"
+
+            [[ "${TLOTTIE_SHORT}" =~ ^[0-9a-f]{7,40}$ ]] \
+              || { echo "ERROR: could not read tlottieRevision"; exit 1; }
+            [[ "${WALLET_COMMIT}" =~ ^[0-9a-f]{40}$ ]] \
+              || { echo "ERROR: could not read walletEngineRevision"; exit 1; }
+            [[ "${PATCHES_COMMIT}" =~ ^[0-9a-f]{40}$ ]] \
+              || { echo "ERROR: could not read patches revision"; exit 1; }
+
+            # prepare.py pins tlottie by a short hash, the ebuild wants the
+            # full one.
+            TLOTTIE_COMMIT="$(curl -fsSL --retry 5 --retry-delay 2 \
+              "${AUTH[@]}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/dkaraush/tlottie/commits/${TLOTTIE_SHORT}" |
+              jq -r .sha)"
+
+            [[ "${TLOTTIE_COMMIT}" =~ ^[0-9a-f]{40}$ ]] \
+              || { echo "ERROR: could not resolve tlottie commit"; exit 1; }
+
+            echo "tlottie:       ${TLOTTIE_COMMIT}"
+            echo "wallet-engine: ${WALLET_COMMIT}"
+            echo "patches:       ${PATCHES_COMMIT}"
+
+            #
+            # Sources of the two Rust libraries
+            #
+            echo "Downloading tlottie and wallet-engine..."
+
+            curl -fL --retry 5 --retry-delay 2 -o tlottie.tar.gz \
+              "https://github.com/dkaraush/tlottie/archive/${TLOTTIE_COMMIT}.tar.gz"
+            curl -fL --retry 5 --retry-delay 2 -o wallet-engine.tar.gz \
+              "https://github.com/i582/wallet-engine/archive/${WALLET_COMMIT}.tar.gz"
+            curl -fL --retry 5 --retry-delay 2 -o wallet-engine.patch \
+              "https://raw.githubusercontent.com/desktop-app/patches/${PATCHES_COMMIT}/wallet-engine.patch"
+
+            tar -xzf tlottie.tar.gz
+            tar -xzf wallet-engine.tar.gz
+
+            TLOTTIE_DIR="tlottie-${TLOTTIE_COMMIT}"
+            WALLET_DIR="wallet-engine-${WALLET_COMMIT}"
+
+            test -f "${TLOTTIE_DIR}/Cargo.toml"
+            test -f "${WALLET_DIR}/Cargo.lock"
+            test -f "${WALLET_DIR}/bindgen/cpp/Cargo.lock"
+
+            # The patch rewrites wallet-engine, including its Cargo.lock.
+            (cd "${WALLET_DIR}" && patch -p1 -s < ../wallet-engine.patch)
+
+            #
+            # Umbrella crate, exactly as the ebuild creates it in src_prepare
+            #
+            mkdir -p tdesktop_rust/src
+
+            cat > tdesktop_rust/Cargo.toml <<EOF
+          [package]
+          name = "tdesktop_rust"
+          version = "0.1.0"
+          edition = "2024"
+
+          [dependencies]
+          tlottie = { path = "../${TLOTTIE_DIR}", features = ["c-api"] }
+          wallet-engine = { path = "../${WALLET_DIR}" }
+          EOF
+
+            printf 'pub use ::tlottie;\npub use ::wallet_engine;\n' \
+              > tdesktop_rust/src/lib.rs
+
+            # Seed the lock with wallet-engine's so the versions match,
+            # cargo then only adds what tlottie needs.
+            cp "${WALLET_DIR}/Cargo.lock" tdesktop_rust/
+
+            (cd tdesktop_rust && cargo metadata --format-version 1 >/dev/null)
+
+            #
+            # Expected crate set: the umbrella lock plus the lock of the
+            # uniffi-bindgen-cpp workspace (used for the wallet_engine
+            # bindings in src_configure).
+            #
+            python - "tdesktop_rust/Cargo.lock" \
+                     "${WALLET_DIR}/bindgen/cpp/Cargo.lock" \
+                     > expected-crates.txt <<'PY'
+          import sys
+          import tomllib
+
+          crates = set()
+          for path in sys.argv[1:]:
+              with open(path, "rb") as f:
+                  lock = tomllib.load(f)
+              for pkg in lock["package"]:
+                  source = pkg.get("source", "")
+                  if source.startswith("registry+"):
+                      crates.add(f"{pkg['name']}@{pkg['version']}")
+                  elif source:
+                      sys.exit(f"unsupported crate source: {source}")
+
+          print("\n".join(sorted(crates)))
+          PY
+
+            EXPECTED="$(wc -l < expected-crates.txt)"
+            echo "Expected crates: ${EXPECTED}"
+
+            #
+            # Crate tarball
+            #
+            echo "Generating crate tarball..."
+
+            pycargoebuild \
+              --no-config \
+              -f \
+              -w \
+              -M \
+              -d "${DISTDIR}" \
+              -l "${WORKDIR}/license-mapping.conf" \
+              -o "${BUILD}/generated.ebuild" \
+              --crate-tarball-path "${CRATE_TARBALL}" \
+              tdesktop_rust \
+              "${WALLET_DIR}/bindgen/cpp/bindgen"
+
+            test -s "${CRATE_TARBALL}"
+
+            ACTUAL="$(tar -tJf "${CRATE_TARBALL}" | grep -c '/\.cargo-checksum\.json$')"
+            echo "Crates in tarball: ${ACTUAL}"
+
+            if [[ "${ACTUAL}" -ne "${EXPECTED}" ]]; then
+              echo "ERROR: expected ${EXPECTED} crates, tarball has ${ACTUAL}."
+              exit 1
+            fi
+
+            ls -lh "${CRATE_TARBALL}"
+
+            #
+            # Release notes: pins and the crate LICENSE variable
+            #
+            {
+              echo "Cargo crate tarball for Telegram Desktop ${VERSION}."
+              echo
+              echo "Crates: ${ACTUAL}"
+              echo
+              echo "Pinned revisions (Telegram/build/prepare/prepare.py):"
+              echo
+              echo "- tlottie: \`${TLOTTIE_COMMIT}\`"
+              echo "- wallet-engine: \`${WALLET_COMMIT}\`"
+              echo "- patches: \`${PATCHES_COMMIT}\`"
+              echo
+              echo "Crate licenses for the ebuild:"
+              echo
+              echo '```'
+              sed -n '/^# Dependent crate licenses/,/^SLOT=/p' "${BUILD}/generated.ebuild" | sed '$d'
+              echo '```'
+            } > release-notes.md
+
+            cat release-notes.md
+
+            #
+            # Publish
+            #
+            echo
+            echo "Publishing release ${RELEASE_TAG}..."
+
+            if gh release view "${RELEASE_TAG}" \
+                --repo "${DISTFILES_REPO}" >/dev/null 2>&1; then
+
+              echo "Release already exists. Uploading asset..."
+
+              gh release upload \
+                "${RELEASE_TAG}" \
+                "${CRATE_TARBALL}" \
+                --repo "${DISTFILES_REPO}" \
+                --clobber
+
+            else
+
+              gh release create \
+                "${RELEASE_TAG}" \
+                "${CRATE_TARBALL}" \
+                --repo "${DISTFILES_REPO}" \
+                --title "Telegram Desktop ${VERSION} crates" \
+                --notes-file release-notes.md
+
+            fi
+
+            echo
+            echo "Published:"
+            echo "https://github.com/${DISTFILES_REPO}/releases/tag/${RELEASE_TAG}"
+
+            cd "${WORKDIR}"
+            rm -rf "${BUILD}"
+
+          done
+
+      - name: Nothing to do
+        if: steps.releases.outputs.versions == ''
+        shell: bash
+        run: |
+          echo "No missing Telegram Desktop releases >= ${MIN_VERSION}."
