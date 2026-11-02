@@ -1,0 +1,125 @@
+name: nmrs-gui Crate Distfiles
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Upstream version to build (e.g. 2.0.0). Leave empty to process all new releases."
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM: freedesktop-rs/nmrs-gui
+  MIN_VERSION: "2.0.0"
+
+jobs:
+  crates:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install pycargoebuild
+        run: pip install --user pycargoebuild
+
+      - name: Work out which versions need a tarball
+        id: todo
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+
+          if [[ -n "${INPUT_VERSION}" ]]; then
+            candidates="${INPUT_VERSION#v}"
+          else
+            # Upstream tags like v2.0.0 (older ones are v0.x-beta / nmrs-gui-v1.x, skipped)
+            candidates="$(gh api --paginate "repos/${UPSTREAM}/tags" --jq '.[].name' \
+              | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+              | sed 's/^v//' | sort -uV)"
+          fi
+
+          todo=""
+          for ver in ${candidates}; do
+            # skip anything older than MIN_VERSION
+            lowest="$(printf '%s\n%s\n' "${MIN_VERSION}" "${ver}" | sort -V | head -n1)"
+            [[ "${lowest}" == "${MIN_VERSION}" ]] || continue
+
+            # skip versions that already have a distfiles release (unless manually forced)
+            if [[ -z "${INPUT_VERSION}" ]] && \
+               gh release view "nmrs-gui-${ver}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+              continue
+            fi
+            todo+="${ver} "
+          done
+
+          echo "Versions to build: ${todo:-none}"
+          echo "versions=${todo}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and publish crate tarballs
+        if: steps.todo.outputs.versions != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSIONS: ${{ steps.todo.outputs.versions }}
+        run: |
+          set -euo pipefail
+          export PATH="${HOME}/.local/bin:${PATH}"
+
+          for ver in ${VERSIONS}; do
+            P="nmrs-gui-${ver}"
+            work="$(mktemp -d)"
+            distdir="${work}/distdir"
+            mkdir -p "${distdir}"
+
+            echo "::group::${P}"
+            curl -fsSL "https://github.com/${UPSTREAM}/archive/refs/tags/v${ver}.tar.gz" \
+              -o "${work}/${P}.tar.gz"
+            tar -xzf "${work}/${P}.tar.gz" -C "${work}"
+            src="${work}/${P}"
+            [[ -d "${src}" ]] || { echo "unexpected source layout"; exit 1; }
+
+            tarball="${work}/${P}-crates.tar.xz"
+
+            # pycargoebuild may exit non-zero (license/ebuild generation) even
+            # when the crate tarball was written, so judge success by the file.
+            ( cd "${work}" && pycargoebuild \
+                --crate-tarball \
+                --crate-tarball-path "${tarball}" \
+                --distdir "${distdir}" \
+                "${src}" ) || echo "pycargoebuild exited non-zero, checking for tarball"
+
+            if [[ ! -s "${tarball}" ]]; then
+              echo "::error::crate tarball for ${P} was not produced"
+              exit 1
+            fi
+
+            # Release notes: licenses and any git crates, to paste into the ebuild
+            notes="${work}/notes.md"
+            {
+              echo "Crate tarball for ${P} (upstream: https://github.com/${UPSTREAM}/releases/tag/v${ver})."
+              echo
+              gen="$(find "${work}" -maxdepth 2 -name '*.ebuild' | head -n1 || true)"
+              if [[ -n "${gen}" ]]; then
+                echo '```'
+                grep -E '^(LICENSE|GIT_CRATES)' -A0 "${gen}" || true
+                echo '```'
+              fi
+            } > "${notes}"
+
+            sha256sum "${tarball}" | tee "${work}/${P}-crates.tar.xz.sha256"
+
+            if gh release view "${P}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+              gh release upload "${P}" "${tarball}" --clobber --repo "${GITHUB_REPOSITORY}"
+            else
+              gh release create "${P}" "${tarball}" \
+                --repo "${GITHUB_REPOSITORY}" \
+                --title "${P}" \
+                --notes-file "${notes}"
+            fi
+            echo "::endgroup::"
+          done
