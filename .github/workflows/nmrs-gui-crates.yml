@@ -1,125 +1,297 @@
 name: nmrs-gui Crate Distfiles
 
 on:
-  schedule:
-    - cron: "0 3 * * *"
   workflow_dispatch:
     inputs:
       version:
-        description: "Upstream version to build (e.g. 2.0.0). Leave empty to process all new releases."
+        description: "nmrs-gui version to process (example: 2.0.0). Leave empty to process all missing releases >= 2.0.0."
         required: false
         type: string
+
+  schedule:
+    - cron: "30 3 * * *"
 
 permissions:
   contents: write
 
 env:
-  UPSTREAM: freedesktop-rs/nmrs-gui
+  UPSTREAM_REPO: freedesktop-rs/nmrs-gui
+  DISTFILES_REPO: Err0rXG/err0rx-overlay-distfiles
   MIN_VERSION: "2.0.0"
 
 jobs:
   crates:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: ">=3.14"
 
-      - name: Install pycargoebuild
-        run: pip install --user pycargoebuild
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
 
-      - name: Work out which versions need a tarball
-        id: todo
+          python -m pip install --upgrade pip
+          python -m pip install portage 'pycargoebuild>=0.17.1'
+
+          echo "Python:"
+          python --version
+
+          echo "Portage:"
+          python -c 'import portage; print(portage.VERSION)'
+
+          echo "pycargoebuild:"
+          pycargoebuild --help >/dev/null
+          echo "pycargoebuild is available."
+
+      - name: Determine releases to build
+        id: releases
+        shell: bash
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           INPUT_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
 
+          WORKDIR="${RUNNER_TEMP}/work"
+          mkdir -p "${WORKDIR}"
+
+          #
+          # Manual version requested
+          #
           if [[ -n "${INPUT_VERSION}" ]]; then
-            candidates="${INPUT_VERSION#v}"
-          else
-            # Upstream tags like v2.0.0 (older ones are v0.x-beta / nmrs-gui-v1.x, skipped)
-            candidates="$(gh api --paginate "repos/${UPSTREAM}/tags" --jq '.[].name' \
-              | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
-              | sed 's/^v//' | sort -uV)"
-          fi
+            REQUESTED_VERSION="${INPUT_VERSION#v}"
 
-          todo=""
-          for ver in ${candidates}; do
-            # skip anything older than MIN_VERSION
-            lowest="$(printf '%s\n%s\n' "${MIN_VERSION}" "${ver}" | sort -V | head -n1)"
-            [[ "${lowest}" == "${MIN_VERSION}" ]] || continue
-
-            # skip versions that already have a distfiles release (unless manually forced)
-            if [[ -z "${INPUT_VERSION}" ]] && \
-               gh release view "nmrs-gui-${ver}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
-              continue
-            fi
-            todo+="${ver} "
-          done
-
-          echo "Versions to build: ${todo:-none}"
-          echo "versions=${todo}" >> "$GITHUB_OUTPUT"
-
-      - name: Build and publish crate tarballs
-        if: steps.todo.outputs.versions != ''
-        env:
-          GH_TOKEN: ${{ github.token }}
-          VERSIONS: ${{ steps.todo.outputs.versions }}
-        run: |
-          set -euo pipefail
-          export PATH="${HOME}/.local/bin:${PATH}"
-
-          for ver in ${VERSIONS}; do
-            P="nmrs-gui-${ver}"
-            work="$(mktemp -d)"
-            distdir="${work}/distdir"
-            mkdir -p "${distdir}"
-
-            echo "::group::${P}"
-            curl -fsSL "https://github.com/${UPSTREAM}/archive/refs/tags/v${ver}.tar.gz" \
-              -o "${work}/${P}.tar.gz"
-            tar -xzf "${work}/${P}.tar.gz" -C "${work}"
-            src="${work}/${P}"
-            [[ -d "${src}" ]] || { echo "unexpected source layout"; exit 1; }
-
-            tarball="${work}/${P}-crates.tar.xz"
-
-            # pycargoebuild may exit non-zero (license/ebuild generation) even
-            # when the crate tarball was written, so judge success by the file.
-            ( cd "${work}" && pycargoebuild \
-                --crate-tarball \
-                --crate-tarball-path "${tarball}" \
-                --distdir "${distdir}" \
-                "${src}" ) || echo "pycargoebuild exited non-zero, checking for tarball"
-
-            if [[ ! -s "${tarball}" ]]; then
-              echo "::error::crate tarball for ${P} was not produced"
+            if [[ "$(printf '%s\n' "${REQUESTED_VERSION}" "${MIN_VERSION}" | sort -V | head -n1)" != "${MIN_VERSION}" ]]; then
+              echo "Requested version ${REQUESTED_VERSION} is below minimum ${MIN_VERSION}."
               exit 1
             fi
 
-            # Release notes: licenses and any git crates, to paste into the ebuild
-            notes="${work}/notes.md"
-            {
-              echo "Crate tarball for ${P} (upstream: https://github.com/${UPSTREAM}/releases/tag/v${ver})."
+            echo "Manual version requested: ${REQUESTED_VERSION}"
+            echo "versions=v${REQUESTED_VERSION}" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          #
+          # Get all upstream tags. Only plain vX.Y.Z tags count: upstream also
+          # has old nmrs-gui-vX.Y.Z and vX.Y.Z-beta tags, which are skipped.
+          #
+          echo "Minimum nmrs-gui version: ${MIN_VERSION}"
+          echo "Checking upstream tags..."
+
+          gh api --paginate \
+            "repos/${UPSTREAM_REPO}/tags?per_page=100" \
+            --jq '.[].name' |
+            grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' |
+            sort -V > "${WORKDIR}/all-upstream-releases.txt" || true
+
+          #
+          # Keep only versions >= MIN_VERSION
+          #
+          : > "${WORKDIR}/upstream-releases.txt"
+
+          while read -r TAG; do
+            [[ -n "${TAG}" ]] || continue
+
+            VERSION="${TAG#v}"
+
+            if [[ "$(printf '%s\n' "${VERSION}" "${MIN_VERSION}" | sort -V | head -n1)" == "${MIN_VERSION}" ]]; then
+              echo "${TAG}" >> "${WORKDIR}/upstream-releases.txt"
+            fi
+          done < "${WORKDIR}/all-upstream-releases.txt"
+
+          if [[ ! -s "${WORKDIR}/upstream-releases.txt" ]]; then
+            echo "No upstream releases >= ${MIN_VERSION} found."
+            echo "versions=" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          echo
+          echo "Upstream releases >= ${MIN_VERSION}:"
+          cat "${WORKDIR}/upstream-releases.txt"
+
+          #
+          # Get releases already published in our distfiles repository
+          #
+          echo
+          echo "Checking existing distfile releases..."
+
+          gh api --paginate \
+            "repos/${DISTFILES_REPO}/releases?per_page=100" \
+            --jq '.[].tag_name' |
+            grep '^nmrs-gui-[0-9]' |
+            sort -V > "${WORKDIR}/existing-releases.txt" || true
+
+          echo "Existing distfile releases:"
+          cat "${WORKDIR}/existing-releases.txt" || true
+
+          #
+          # Find missing releases
+          #
+          : > "${WORKDIR}/missing-releases.txt"
+
+          while read -r TAG; do
+            [[ -n "${TAG}" ]] || continue
+
+            VERSION="${TAG#v}"
+            RELEASE_TAG="nmrs-gui-${VERSION}"
+
+            if ! grep -Fxq "${RELEASE_TAG}" \
+                "${WORKDIR}/existing-releases.txt"; then
+              echo "${TAG}" >> "${WORKDIR}/missing-releases.txt"
+            fi
+          done < "${WORKDIR}/upstream-releases.txt"
+
+          echo
+          echo "Missing releases:"
+          cat "${WORKDIR}/missing-releases.txt" || true
+
+          VERSIONS="$(paste -sd, "${WORKDIR}/missing-releases.txt")"
+
+          echo "versions=${VERSIONS}" >> "${GITHUB_OUTPUT}"
+
+      - name: Build and publish crate tarballs
+        if: steps.releases.outputs.versions != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_LIST: ${{ steps.releases.outputs.versions }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          WORKDIR="${RUNNER_TEMP}/nmrs-gui"
+          DISTDIR="${WORKDIR}/distfiles"
+          SOURCEDIR="${WORKDIR}/sources"
+
+          mkdir -p "${DISTDIR}" "${SOURCEDIR}"
+
+          curl -fL --retry 5 --retry-delay 2 \
+            -o "${RUNNER_TEMP}/license-mapping.conf" \
+            "https://raw.githubusercontent.com/gentoo/gentoo/master/metadata/license-mapping.conf"
+
+          IFS=',' read -ra TAGS <<< "${TAG_LIST}"
+
+          for TAG in "${TAGS[@]}"; do
+            [[ -n "${TAG}" ]] || continue
+
+            VERSION="${TAG#v}"
+
+            PACKAGE="nmrs-gui-${VERSION}"
+            RELEASE_TAG="nmrs-gui-${VERSION}"
+
+            SOURCE_ARCHIVE="${SOURCEDIR}/${PACKAGE}.tar.gz"
+            SOURCE_DIR="${SOURCEDIR}/nmrs-gui-${VERSION}"
+            CRATE_TARBALL="${DISTDIR}/${PACKAGE}-crates.tar.xz"
+
+            echo
+            echo "============================================================"
+            echo "nmrs-gui ${VERSION}"
+            echo "============================================================"
+
+            rm -rf "${SOURCE_DIR}"
+            rm -f "${SOURCE_ARCHIVE}"
+            rm -f "${CRATE_TARBALL}"
+
+            echo "Downloading source..."
+
+            curl -fL --retry 5 --retry-delay 2 \
+              -o "${SOURCE_ARCHIVE}" \
+              "https://github.com/${UPSTREAM_REPO}/archive/refs/tags/${TAG}.tar.gz"
+
+            echo "Extracting source..."
+
+            tar -xzf "${SOURCE_ARCHIVE}" \
+              -C "${SOURCEDIR}"
+
+            test -f "${SOURCE_DIR}/Cargo.toml"
+            test -f "${SOURCE_DIR}/Cargo.lock"
+
+            echo "Generating crate tarball..."
+
+            PYCARGO_STATUS=0
+
+            pycargoebuild \
+              -f \
+              -w \
+              -L \
+              -d "${DISTDIR}" \
+              -l "${RUNNER_TEMP}/license-mapping.conf" \
+              --crate-tarball-path "${CRATE_TARBALL}" \
+              "${SOURCE_DIR}/" || PYCARGO_STATUS=$?
+
+            #
+            # pycargoebuild writes the crate tarball before entering its
+            # license-processing stage, which can return non-zero on a
+            # runner without a Gentoo repository. Only the tarball matters.
+            #
+            if [[ ! -s "${CRATE_TARBALL}" ]]; then
+              echo "ERROR: crate tarball was not generated."
+              exit "${PYCARGO_STATUS:-1}"
+            fi
+
+            if [[ "${PYCARGO_STATUS}" -ne 0 ]]; then
               echo
-              gen="$(find "${work}" -maxdepth 2 -name '*.ebuild' | head -n1 || true)"
-              if [[ -n "${gen}" ]]; then
+              echo "pycargoebuild exited with status ${PYCARGO_STATUS},"
+              echo "but the crate tarball was successfully generated."
+              echo "Continuing."
+            fi
+
+            echo
+            echo "Crate tarball:"
+            ls -lh "${CRATE_TARBALL}"
+
+            #
+            # Best effort: surface the generated LICENSE / GIT_CRATES lines in
+            # the release notes so they can be pasted into the ebuild.
+            #
+            NOTES="${WORKDIR}/notes-${VERSION}.md"
+            {
+              echo "Cargo crate tarball for nmrs-gui ${VERSION}."
+              GENERATED="$(find "${SOURCE_DIR}" "${DISTDIR}" -maxdepth 1 -name '*.ebuild' | head -n1 || true)"
+              if [[ -n "${GENERATED}" ]]; then
+                echo
                 echo '```'
-                grep -E '^(LICENSE|GIT_CRATES)' -A0 "${gen}" || true
+                grep -E '^(LICENSE|GIT_CRATES)' "${GENERATED}" || true
                 echo '```'
               fi
-            } > "${notes}"
+            } > "${NOTES}"
 
-            sha256sum "${tarball}" | tee "${work}/${P}-crates.tar.xz.sha256"
+            echo
+            echo "Publishing release ${RELEASE_TAG}..."
 
-            if gh release view "${P}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
-              gh release upload "${P}" "${tarball}" --clobber --repo "${GITHUB_REPOSITORY}"
+            if gh release view "${RELEASE_TAG}" \
+                --repo "${DISTFILES_REPO}" >/dev/null 2>&1; then
+
+              echo "Release already exists. Uploading asset..."
+
+              gh release upload \
+                "${RELEASE_TAG}" \
+                "${CRATE_TARBALL}" \
+                --repo "${DISTFILES_REPO}" \
+                --clobber
+
             else
-              gh release create "${P}" "${tarball}" \
-                --repo "${GITHUB_REPOSITORY}" \
-                --title "${P}" \
-                --notes-file "${notes}"
+
+              gh release create \
+                "${RELEASE_TAG}" \
+                "${CRATE_TARBALL}" \
+                --repo "${DISTFILES_REPO}" \
+                --title "nmrs-gui ${VERSION} crates" \
+                --notes-file "${NOTES}"
+
             fi
-            echo "::endgroup::"
+
+            echo
+            echo "Published:"
+            echo "https://github.com/${DISTFILES_REPO}/releases/tag/${RELEASE_TAG}"
+
           done
+
+      - name: Nothing to do
+        if: steps.releases.outputs.versions == ''
+        shell: bash
+        run: |
+          echo "No missing nmrs-gui releases >= ${MIN_VERSION}."
