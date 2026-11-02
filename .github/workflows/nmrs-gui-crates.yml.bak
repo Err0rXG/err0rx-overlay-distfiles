@@ -47,6 +47,9 @@ jobs:
           pycargoebuild --help >/dev/null
           echo "pycargoebuild is available."
 
+          echo "cargo:"
+          cargo --version
+
       - name: Determine releases to build
         id: releases
         shell: bash
@@ -59,9 +62,7 @@ jobs:
           WORKDIR="${RUNNER_TEMP}/work"
           mkdir -p "${WORKDIR}"
 
-          #
           # Manual version requested
-          #
           if [[ -n "${INPUT_VERSION}" ]]; then
             REQUESTED_VERSION="${INPUT_VERSION#v}"
 
@@ -75,82 +76,40 @@ jobs:
             exit 0
           fi
 
-          #
-          # Get all upstream tags. Only plain vX.Y.Z tags count: upstream also
-          # has old nmrs-gui-vX.Y.Z and vX.Y.Z-beta tags, which are skipped.
-          #
-          echo "Minimum nmrs-gui version: ${MIN_VERSION}"
-          echo "Checking upstream tags..."
+          # Upstream tags: plain vX.Y.Z only (skips nmrs-gui-vX.Y.Z and -beta tags)
+          gh api --paginate "repos/${UPSTREAM_REPO}/tags?per_page=100" --jq '.[].name' \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+            | sed 's/^v//' \
+            | sort -V > "${WORKDIR}/all.txt" || true
 
-          gh api --paginate \
-            "repos/${UPSTREAM_REPO}/tags?per_page=100" \
-            --jq '.[].name' |
-            grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' |
-            sort -V > "${WORKDIR}/all-upstream-releases.txt" || true
+          # Keep versions >= MIN_VERSION that really exist as upstream tags
+          { echo "${MIN_VERSION}"; cat "${WORKDIR}/all.txt"; } \
+            | sort -Vu \
+            | sed -n "/^${MIN_VERSION}\$/,\$p" \
+            | grep -Fx -f "${WORKDIR}/all.txt" > "${WORKDIR}/upstream.txt" || true
 
-          #
-          # Keep only versions >= MIN_VERSION
-          #
-          : > "${WORKDIR}/upstream-releases.txt"
+          echo "Upstream versions >= ${MIN_VERSION}:"
+          cat "${WORKDIR}/upstream.txt"
 
-          while read -r TAG; do
-            [[ -n "${TAG}" ]] || continue
+          # Versions that already have a distfiles release
+          gh api --paginate "repos/${DISTFILES_REPO}/releases?per_page=100" \
+            --jq '.[].tag_name' > "${WORKDIR}/release-tags.txt"
 
-            VERSION="${TAG#v}"
+          echo "All release tags in ${DISTFILES_REPO}:"
+          cat "${WORKDIR}/release-tags.txt"
 
-            if [[ "$(printf '%s\n' "${VERSION}" "${MIN_VERSION}" | sort -V | head -n1)" == "${MIN_VERSION}" ]]; then
-              echo "${TAG}" >> "${WORKDIR}/upstream-releases.txt"
-            fi
-          done < "${WORKDIR}/all-upstream-releases.txt"
+          grep '^nmrs-gui-[0-9]' "${WORKDIR}/release-tags.txt" \
+            | sed 's/^nmrs-gui-//' \
+            | sort -V > "${WORKDIR}/existing.txt" || true
 
-          if [[ ! -s "${WORKDIR}/upstream-releases.txt" ]]; then
-            echo "No upstream releases >= ${MIN_VERSION} found."
-            echo "versions=" >> "${GITHUB_OUTPUT}"
-            exit 0
-          fi
+          echo "Existing nmrs-gui distfile releases:"
+          cat "${WORKDIR}/existing.txt"
 
-          echo
-          echo "Upstream releases >= ${MIN_VERSION}:"
-          cat "${WORKDIR}/upstream-releases.txt"
+          # Missing = upstream minus existing
+          VERSIONS="$(comm -23 <(sort "${WORKDIR}/upstream.txt") <(sort "${WORKDIR}/existing.txt") \
+            | sort -V | sed 's/^/v/' | paste -sd, -)"
 
-          #
-          # Get releases already published in our distfiles repository
-          #
-          echo
-          echo "Checking existing distfile releases..."
-
-          gh api --paginate \
-            "repos/${DISTFILES_REPO}/releases?per_page=100" \
-            --jq '.[].tag_name' |
-            grep '^nmrs-gui-[0-9]' |
-            sort -V > "${WORKDIR}/existing-releases.txt" || true
-
-          echo "Existing distfile releases:"
-          cat "${WORKDIR}/existing-releases.txt" || true
-
-          #
-          # Find missing releases
-          #
-          : > "${WORKDIR}/missing-releases.txt"
-
-          while read -r TAG; do
-            [[ -n "${TAG}" ]] || continue
-
-            VERSION="${TAG#v}"
-            RELEASE_TAG="nmrs-gui-${VERSION}"
-
-            if ! grep -Fxq "${RELEASE_TAG}" \
-                "${WORKDIR}/existing-releases.txt"; then
-              echo "${TAG}" >> "${WORKDIR}/missing-releases.txt"
-            fi
-          done < "${WORKDIR}/upstream-releases.txt"
-
-          echo
-          echo "Missing releases:"
-          cat "${WORKDIR}/missing-releases.txt" || true
-
-          VERSIONS="$(paste -sd, "${WORKDIR}/missing-releases.txt")"
-
+          echo "Missing releases: ${VERSIONS:-none}"
           echo "versions=${VERSIONS}" >> "${GITHUB_OUTPUT}"
 
       - name: Build and publish crate tarballs
@@ -165,12 +124,88 @@ jobs:
           WORKDIR="${RUNNER_TEMP}/nmrs-gui"
           DISTDIR="${WORKDIR}/distfiles"
           SOURCEDIR="${WORKDIR}/sources"
+          NOTES_SCRIPT="${WORKDIR}/release_notes.py"
 
           mkdir -p "${DISTDIR}" "${SOURCEDIR}"
 
           curl -fL --retry 5 --retry-delay 2 \
             -o "${RUNNER_TEMP}/license-mapping.conf" \
             "https://raw.githubusercontent.com/gentoo/gentoo/master/metadata/license-mapping.conf"
+
+          # Release-notes generator: crate count, git-pinned crates and the
+          # license line for the ebuild, all computed from cargo metadata.
+          cat > "${NOTES_SCRIPT}" <<'PY'
+          import json
+          import re
+          import subprocess
+          import sys
+
+          src, version, out = sys.argv[1:4]
+
+          meta = json.loads(subprocess.check_output([
+              "cargo", "metadata", "--format-version", "1", "--locked",
+              "--manifest-path", f"{src}/Cargo.toml",
+          ]))
+
+          # Packages with a source are the vendored dependencies (not the root crate)
+          pkgs = [p for p in meta["packages"] if p.get("source")]
+
+          # SPDX -> Gentoo license names (anything unlisted passes through)
+          MAP = {
+              "BSD-3-Clause": "BSD",
+              "BSD-2-Clause": "BSD-2",
+              "Zlib": "ZLIB",
+              "BSL-1.0": "Boost-1.0",
+          }
+
+          licenses = set()
+          unlicensed = []
+          for p in pkgs:
+              expr = p.get("license")
+              if not expr:
+                  unlicensed.append(f"{p['name']}-{p['version']}")
+                  continue
+              expr = re.sub(r"\s+WITH\s+\S+", "", expr)  # drop exceptions
+              for tok in re.split(r"[\s()/]+", expr):
+                  if tok and tok not in ("AND", "OR"):
+                      licenses.add(MAP.get(tok, tok))
+
+          git = sorted({
+              (p["name"], p["source"].split("#")[-1], p["source"].split("?")[0])
+              for p in pkgs
+              if p["source"].startswith("git+")
+          })
+
+          lines = [
+              f"Cargo crate tarball for nmrs-gui {version}.",
+              f"Crates: {len(pkgs)}",
+          ]
+
+          if git:
+              lines += ["", "Pinned git revisions (Cargo.lock):", ""]
+              for name, rev, url in git:
+                  lines.append(f"* {name}: `{rev}` ({url})")
+
+          lines += [
+              "",
+              "Crate licenses for the ebuild:",
+              "",
+              "```",
+              "# Dependent crate licenses",
+              'LICENSE+=" ' + " ".join(sorted(licenses)) + '"',
+              "```",
+          ]
+
+          if unlicensed:
+              lines += [
+                  "",
+                  "Crates without a license field (check manually): "
+                  + ", ".join(unlicensed),
+              ]
+
+          with open(out, "w") as f:
+              f.write("\n".join(lines) + "\n")
+          PY
 
           IFS=',' read -ra TAGS <<< "${TAG_LIST}"
 
@@ -185,6 +220,7 @@ jobs:
             SOURCE_ARCHIVE="${SOURCEDIR}/${PACKAGE}.tar.gz"
             SOURCE_DIR="${SOURCEDIR}/nmrs-gui-${VERSION}"
             CRATE_TARBALL="${DISTDIR}/${PACKAGE}-crates.tar.xz"
+            NOTES="${WORKDIR}/notes-${VERSION}.md"
 
             echo
             echo "============================================================"
@@ -222,11 +258,9 @@ jobs:
               --crate-tarball-path "${CRATE_TARBALL}" \
               "${SOURCE_DIR}/" || PYCARGO_STATUS=$?
 
-            #
             # pycargoebuild writes the crate tarball before entering its
             # license-processing stage, which can return non-zero on a
             # runner without a Gentoo repository. Only the tarball matters.
-            #
             if [[ ! -s "${CRATE_TARBALL}" ]]; then
               echo "ERROR: crate tarball was not generated."
               exit "${PYCARGO_STATUS:-1}"
@@ -242,22 +276,15 @@ jobs:
             echo
             echo "Crate tarball:"
             ls -lh "${CRATE_TARBALL}"
+            sha256sum "${CRATE_TARBALL}"
 
-            #
-            # Best effort: surface the generated LICENSE / GIT_CRATES lines in
-            # the release notes so they can be pasted into the ebuild.
-            #
-            NOTES="${WORKDIR}/notes-${VERSION}.md"
-            {
-              echo "Cargo crate tarball for nmrs-gui ${VERSION}."
-              GENERATED="$(find "${SOURCE_DIR}" "${DISTDIR}" -maxdepth 1 -name '*.ebuild' | head -n1 || true)"
-              if [[ -n "${GENERATED}" ]]; then
-                echo
-                echo '```'
-                grep -E '^(LICENSE|GIT_CRATES)' "${GENERATED}" || true
-                echo '```'
-              fi
-            } > "${NOTES}"
+            echo
+            echo "Generating release notes..."
+
+            python "${NOTES_SCRIPT}" "${SOURCE_DIR}" "${VERSION}" "${NOTES}"
+
+            echo
+            cat "${NOTES}"
 
             echo
             echo "Publishing release ${RELEASE_TAG}..."
@@ -265,13 +292,18 @@ jobs:
             if gh release view "${RELEASE_TAG}" \
                 --repo "${DISTFILES_REPO}" >/dev/null 2>&1; then
 
-              echo "Release already exists. Uploading asset..."
+              echo "Release already exists. Uploading asset and refreshing notes..."
 
               gh release upload \
                 "${RELEASE_TAG}" \
                 "${CRATE_TARBALL}" \
                 --repo "${DISTFILES_REPO}" \
                 --clobber
+
+              gh release edit \
+                "${RELEASE_TAG}" \
+                --repo "${DISTFILES_REPO}" \
+                --notes-file "${NOTES}"
 
             else
 

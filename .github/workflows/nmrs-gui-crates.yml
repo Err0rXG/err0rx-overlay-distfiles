@@ -132,15 +132,16 @@ jobs:
             -o "${RUNNER_TEMP}/license-mapping.conf" \
             "https://raw.githubusercontent.com/gentoo/gentoo/master/metadata/license-mapping.conf"
 
-          # Release-notes generator: crate count, git-pinned crates and the
-          # license line for the ebuild, all computed from cargo metadata.
+          # Release-notes generator: crate count, upstream commit, git-pinned
+          # crates and the license line for the ebuild, all computed from
+          # cargo metadata and the tag's commit.
           cat > "${NOTES_SCRIPT}" <<'PY'
           import json
           import re
           import subprocess
           import sys
 
-          src, version, out = sys.argv[1:4]
+          src, version, commit, out = sys.argv[1:5]
 
           meta = json.loads(subprocess.check_output([
               "cargo", "metadata", "--format-version", "1", "--locked",
@@ -156,6 +157,15 @@ jobs:
               "BSD-2-Clause": "BSD-2",
               "Zlib": "ZLIB",
               "BSL-1.0": "Boost-1.0",
+              "NCSA": "UoI-NCSA",
+              "GPL-2.0-only": "GPL-2",
+              "GPL-2.0-or-later": "GPL-2+",
+              "GPL-3.0-only": "GPL-3",
+              "GPL-3.0-or-later": "GPL-3+",
+              "LGPL-2.1-only": "LGPL-2.1",
+              "LGPL-2.1-or-later": "LGPL-2.1+",
+              "LGPL-3.0-only": "LGPL-3",
+              "LGPL-3.0-or-later": "LGPL-3+",
           }
 
           licenses = set()
@@ -179,6 +189,12 @@ jobs:
           lines = [
               f"Cargo crate tarball for nmrs-gui {version}.",
               f"Crates: {len(pkgs)}",
+              "",
+              f"Upstream commit (v{version}):",
+              "",
+              "```",
+              f'GIT_COMMIT="{commit}"',
+              "```",
           ]
 
           if git:
@@ -231,6 +247,19 @@ jobs:
             rm -f "${SOURCE_ARCHIVE}"
             rm -f "${CRATE_TARBALL}"
 
+            echo "Resolving upstream commit for ${TAG}..."
+
+            # Works for both lightweight and annotated tags
+            COMMIT_SHA="$(gh api "repos/${UPSTREAM_REPO}/commits/${TAG}" --jq '.sha')"
+
+            if [[ ! "${COMMIT_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "ERROR: could not resolve a commit hash for ${TAG} (got '${COMMIT_SHA}')."
+              exit 1
+            fi
+
+            GIT_COMMIT="${COMMIT_SHA:0:7}"
+            echo "Commit: ${COMMIT_SHA} (short: ${GIT_COMMIT})"
+
             echo "Downloading source..."
 
             curl -fL --retry 5 --retry-delay 2 \
@@ -281,7 +310,7 @@ jobs:
             echo
             echo "Generating release notes..."
 
-            python "${NOTES_SCRIPT}" "${SOURCE_DIR}" "${VERSION}" "${NOTES}"
+            python "${NOTES_SCRIPT}" "${SOURCE_DIR}" "${VERSION}" "${GIT_COMMIT}" "${NOTES}"
 
             echo
             cat "${NOTES}"
