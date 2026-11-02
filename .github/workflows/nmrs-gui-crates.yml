@@ -62,9 +62,7 @@ jobs:
           WORKDIR="${RUNNER_TEMP}/work"
           mkdir -p "${WORKDIR}"
 
-          #
           # Manual version requested
-          #
           if [[ -n "${INPUT_VERSION}" ]]; then
             REQUESTED_VERSION="${INPUT_VERSION#v}"
 
@@ -78,65 +76,33 @@ jobs:
             exit 0
           fi
 
-          #
-          # Get all upstream tags. Only plain vX.Y.Z tags count: upstream also
-          # has old nmrs-gui-vX.Y.Z and vX.Y.Z-beta tags, which are skipped.
-          #
-          echo "Minimum nmrs-gui version: ${MIN_VERSION}"
-          echo "Checking upstream tags..."
+          # Upstream tags: plain vX.Y.Z only (skips nmrs-gui-vX.Y.Z and -beta tags)
+          gh api --paginate "repos/${UPSTREAM_REPO}/tags?per_page=100" --jq '.[].name' \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+            | sed 's/^v//' \
+            | sort -V > "${WORKDIR}/all.txt" || true
 
-          gh api --paginate \
-            "repos/${UPSTREAM_REPO}/tags?per_page=100" \
-            --jq '.[].name' |
-            grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' |
-            sort -V > "${WORKDIR}/all-upstream-releases.txt" || true
+          # Keep versions >= MIN_VERSION (sort MIN in, cut everything before it, keep real tags only)
+          { echo "${MIN_VERSION}"; cat "${WORKDIR}/all.txt"; } \
+            | sort -Vu \
+            | sed -n "/^${MIN_VERSION}\$/,\$p" \
+            | grep -Fx -f "${WORKDIR}/all.txt" > "${WORKDIR}/upstream.txt" || true
 
-          #
-          # Keep only versions >= MIN_VERSION
-          #
-          : > "${WORKDIR}/upstream-releases.txt"
+          echo "Upstream versions >= ${MIN_VERSION}:"
+          cat "${WORKDIR}/upstream.txt"
 
-          while read -r TAG; do
-            [[ -n "${TAG}" ]] || continue
-
-            VERSION="${TAG#v}"
-
-            if [[ "$(printf '%s\n' "${VERSION}" "${MIN_VERSION}" | sort -V | head -n1)" == "${MIN_VERSION}" ]]; then
-              echo "${TAG}" >> "${WORKDIR}/upstream-releases.txt"
-            fi
-          done < "${WORKDIR}/all-upstream-releases.txt"
-
-          if [[ ! -s "${WORKDIR}/upstream-releases.txt" ]]; then
-            echo "No upstream releases >= ${MIN_VERSION} found."
-            echo "versions=" >> "${GITHUB_OUTPUT}"
-            exit 0
-          fi
-
-          echo
-          echo "Upstream releases >= ${MIN_VERSION}:"
-          cat "${WORKDIR}/upstream-releases.txt"
-
-          #
-          # Get releases already published in our distfiles repository
-          #
-          echo
-          echo "Checking existing distfile releases..."
-
-          gh api --paginate \
-            "repos/${DISTFILES_REPO}/releases?per_page=100" \
-            --jq '.[].tag_name' |
-            grep '^nmrs-gui-[0-9]' |
-            sort -V > "${WORKDIR}/existing-releases.txt" || true
+          # Versions that already have a distfiles release
+          gh api --paginate "repos/${DISTFILES_REPO}/releases?per_page=100" --jq '.[].tag_name' \
+            | grep '^nmrs-gui-[0-9]' \
+            | sed 's/^nmrs-gui-//' \
+            | sort -V > "${WORKDIR}/existing.txt" || true
 
           echo "Existing distfile releases:"
-          cat "${WORKDIR}/existing-releases.txt" || true
+          cat "${WORKDIR}/existing.txt"
 
-          #
-          # Find missing releases
-          #
-          : > "${WORKDIR}/missing-releases.txt"
+          # Missing = upstream minus existing
+          VERSIONS="$(comm -23 <(sort "${WORKDIR}/upstream.txt") <(sort "${WORKDIR}/existing.txt") \
+            | sort -V | sed 's/^/v/' | paste -sd, -)"
 
-          while read -r TAG; do
-            [[ -n "${TAG}" ]] || continue
-
-            VERSION="${TAG#v}"
+          echo "Missing releases: ${VERSIONS:-none}"
+          echo "versions=${VERSIONS}" >> "${GITHUB_OUTPUT}"
